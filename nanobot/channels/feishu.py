@@ -441,14 +441,12 @@ class FeishuChannel(BaseChannel):
             except ImportError:
                 logger.warning("PatchMessageRequest not available in current lark-oapi version")
                 return False
+            # Some lark-oapi versions don't provide msg_type() on PatchMessageRequestBodyBuilder.
+            # For process-card updates we only need to patch content.
+            body = PatchMessageRequestBody.builder().content(content).build()
             request = PatchMessageRequest.builder() \
                 .message_id(message_id) \
-                .request_body(
-                    PatchMessageRequestBody.builder()
-                    .msg_type(msg_type)
-                    .content(content)
-                    .build()
-                ).build()
+                .request_body(body).build()
             response = self._client.im.v1.message.patch(request)
             if not response.success():
                 logger.warning("Failed to update message: message_id={}, code={}, msg={}", message_id, response.code, response.msg)

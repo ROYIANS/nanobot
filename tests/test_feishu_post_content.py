@@ -1,4 +1,5 @@
 import json
+import sys
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -261,3 +262,67 @@ async def test_send_turn_done_cleans_card_and_reaction(monkeypatch) -> None:
     assert sent_calls and sent_calls[0][2] == "text"
     del_card.assert_awaited_once_with("om_done")
     del_reaction.assert_awaited_once_with("om_done")
+
+
+def test_update_message_sync_supports_patch_body_without_msg_type(monkeypatch) -> None:
+    channel = _make_channel()
+
+    recorded: dict[str, object] = {}
+
+    class _BodyBuilder:
+        def __init__(self) -> None:
+            self._content = None
+
+        def content(self, value: str):
+            self._content = value
+            return self
+
+        def build(self):
+            return {"content": self._content}
+
+    class _Body:
+        @staticmethod
+        def builder():
+            return _BodyBuilder()
+
+    class _ReqBuilder:
+        def __init__(self) -> None:
+            self._message_id = None
+            self._body = None
+
+        def message_id(self, value: str):
+            self._message_id = value
+            return self
+
+        def request_body(self, value):
+            self._body = value
+            return self
+
+        def build(self):
+            return {"message_id": self._message_id, "body": self._body}
+
+    class _Req:
+        @staticmethod
+        def builder():
+            return _ReqBuilder()
+
+    fake_v1 = SimpleNamespace(
+        PatchMessageRequest=_Req,
+        PatchMessageRequestBody=_Body,
+    )
+    monkeypatch.setitem(sys.modules, "lark_oapi.api.im.v1", fake_v1)
+
+    class _FakeMessageApi:
+        def patch(self, request):
+            recorded["request"] = request
+            return SimpleNamespace(success=lambda: True)
+
+    channel._client = SimpleNamespace(
+        im=SimpleNamespace(v1=SimpleNamespace(message=_FakeMessageApi()))
+    )
+
+    ok = channel._update_message_sync("om_patch", "interactive", "{\"x\":1}")
+
+    assert ok is True
+    assert recorded["request"]["message_id"] == "om_patch"
+    assert recorded["request"]["body"] == {"content": "{\"x\":1}"}

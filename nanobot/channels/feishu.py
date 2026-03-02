@@ -269,6 +269,8 @@ class FeishuChannel(BaseChannel):
         self._ws_thread: threading.Thread | None = None
         self._processed_message_ids: OrderedDict[str, None] = OrderedDict()  # Ordered dedup cache
         self._reaction_ids: OrderedDict[str, str] = OrderedDict()  # message_id -> reaction_id
+        self._processing_cards: OrderedDict[str, str] = OrderedDict()  # source message_id -> card message_id
+        self._processing_card_text: OrderedDict[str, str] = OrderedDict()  # source message_id -> latest text
         self._loop: asyncio.AbstractEventLoop | None = None
 
     async def start(self) -> None:
@@ -415,6 +417,119 @@ class FeishuChannel(BaseChannel):
             await self._delete_reaction(message_id, reaction_id)
         finally:
             self._reaction_ids.pop(message_id, None)
+
+    @staticmethod
+    def _build_processing_card(progress_text: str) -> dict:
+        """Build a lightweight progress card for one turn."""
+        text = (progress_text or "").strip() or "正在分析你的问题…"
+        return {
+            "config": {"wide_screen_mode": True, "update_multi": True},
+            "header": {
+                "title": {"tag": "plain_text", "content": "Nanobot 正在处理中"},
+                "template": "blue",
+            },
+            "elements": [
+                {"tag": "markdown", "content": text},
+            ],
+        }
+
+    def _update_message_sync(self, message_id: str, msg_type: str, content: str) -> bool:
+        """Sync helper for updating an existing message."""
+        try:
+            try:
+                from lark_oapi.api.im.v1 import PatchMessageRequest, PatchMessageRequestBody
+            except ImportError:
+                logger.warning("PatchMessageRequest not available in current lark-oapi version")
+                return False
+            request = PatchMessageRequest.builder() \
+                .message_id(message_id) \
+                .request_body(
+                    PatchMessageRequestBody.builder()
+                    .msg_type(msg_type)
+                    .content(content)
+                    .build()
+                ).build()
+            response = self._client.im.v1.message.patch(request)
+            if not response.success():
+                logger.warning("Failed to update message: message_id={}, code={}, msg={}", message_id, response.code, response.msg)
+                return False
+            return True
+        except Exception as e:
+            logger.warning("Error updating message {}: {}", message_id, e)
+            return False
+
+    def _delete_message_sync(self, message_id: str) -> bool:
+        """Sync helper for deleting a message (message recall)."""
+        try:
+            try:
+                from lark_oapi.api.im.v1 import DeleteMessageRequest
+            except ImportError:
+                logger.warning("DeleteMessageRequest not available in current lark-oapi version")
+                return False
+            request = DeleteMessageRequest.builder().message_id(message_id).build()
+            response = self._client.im.v1.message.delete(request)
+            if not response.success():
+                logger.warning("Failed to delete message: message_id={}, code={}, msg={}", message_id, response.code, response.msg)
+                return False
+            return True
+        except Exception as e:
+            logger.warning("Error deleting message {}: {}", message_id, e)
+            return False
+
+    async def _create_processing_card_for_message(self, source_message_id: str, receive_id_type: str, receive_id: str) -> None:
+        """Create a process card for one inbound message if absent."""
+        if not source_message_id or source_message_id in self._processing_cards:
+            return
+        card = self._build_processing_card("正在思考…")
+        loop = asyncio.get_running_loop()
+        card_message_id = await loop.run_in_executor(
+            None,
+            self._send_message_sync,
+            receive_id_type,
+            receive_id,
+            "interactive",
+            json.dumps(card, ensure_ascii=False),
+        )
+        if card_message_id:
+            self._processing_cards[source_message_id] = card_message_id
+            self._processing_card_text[source_message_id] = "正在思考…"
+            while len(self._processing_cards) > 1000:
+                old_key, _ = self._processing_cards.popitem(last=False)
+                self._processing_card_text.pop(old_key, None)
+
+    async def _update_processing_card_for_message(self, source_message_id: str, progress_text: str) -> None:
+        """Update the process card content for one inbound message."""
+        card_message_id = self._processing_cards.get(source_message_id)
+        if not card_message_id:
+            return
+        normalized = (progress_text or "").strip()
+        if not normalized:
+            return
+        if self._processing_card_text.get(source_message_id) == normalized:
+            return
+        card = self._build_processing_card(normalized)
+        loop = asyncio.get_running_loop()
+        ok = await loop.run_in_executor(
+            None,
+            self._update_message_sync,
+            card_message_id,
+            "interactive",
+            json.dumps(card, ensure_ascii=False),
+        )
+        if ok:
+            self._processing_card_text[source_message_id] = normalized
+
+    async def _delete_processing_card_for_message(self, source_message_id: str) -> None:
+        """Delete and clear process card for one inbound message."""
+        card_message_id = self._processing_cards.get(source_message_id)
+        if not card_message_id:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, self._delete_message_sync, card_message_id)
+        finally:
+            self._processing_cards.pop(source_message_id, None)
+            self._processing_card_text.pop(source_message_id, None)
 
     # Regex to match markdown tables (header + separator + data rows)
     _TABLE_RE = re.compile(
@@ -642,8 +757,8 @@ class FeishuChannel(BaseChannel):
 
         return None, f"[{msg_type}: download failed]"
 
-    def _send_message_sync(self, receive_id_type: str, receive_id: str, msg_type: str, content: str) -> bool:
-        """Send a single message (text/image/file) synchronously."""
+    def _send_message_sync(self, receive_id_type: str, receive_id: str, msg_type: str, content: str) -> str | None:
+        """Send a single message (text/image/file/interactive) synchronously and return message_id."""
         try:
             request = CreateMessageRequest.builder() \
                 .receive_id_type(receive_id_type) \
@@ -660,12 +775,12 @@ class FeishuChannel(BaseChannel):
                     "Failed to send Feishu {} message: code={}, msg={}, log_id={}",
                     msg_type, response.code, response.msg, response.get_log_id()
                 )
-                return False
+                return None
             logger.debug("Feishu {} message sent to {}", msg_type, receive_id)
-            return True
+            return getattr(response.data, "message_id", None)
         except Exception as e:
             logger.error("Error sending Feishu {} message: {}", msg_type, e)
-            return False
+            return None
 
     async def send(self, msg: OutboundMessage) -> None:
         """Send a message through Feishu, including media (images/files) if present."""
@@ -678,6 +793,14 @@ class FeishuChannel(BaseChannel):
             loop = asyncio.get_running_loop()
             source_message_id = str(msg.metadata.get("message_id", "")).strip()
             is_turn_done = bool(msg.metadata.get("_turn_done"))
+            is_progress = bool(msg.metadata.get("_progress"))
+            is_tool_hint = bool(msg.metadata.get("_tool_hint"))
+
+            if is_progress:
+                if source_message_id:
+                    progress_prefix = "正在调用工具： " if is_tool_hint else "处理中： "
+                    await self._update_processing_card_for_message(source_message_id, f"{progress_prefix}{msg.content}")
+                return
 
             for file_path in msg.media:
                 if not os.path.isfile(file_path):
@@ -708,6 +831,7 @@ class FeishuChannel(BaseChannel):
 
             # Only clear reaction when agent explicitly marks this turn as complete.
             if source_message_id and is_turn_done:
+                await self._delete_processing_card_for_message(source_message_id)
                 await self._delete_reaction_for_message(source_message_id)
 
         except Exception as e:
@@ -746,6 +870,8 @@ class FeishuChannel(BaseChannel):
             chat_id = message.chat_id
             chat_type = message.chat_type
             msg_type = message.message_type
+            reply_to = chat_id if chat_type == "group" else sender_id
+            receive_id_type = "chat_id" if reply_to.startswith("oc_") else "open_id"
 
             # Add reaction and track it for completion cleanup.
             reaction_id = await self._add_reaction(message_id, self.config.react_emoji)
@@ -754,6 +880,7 @@ class FeishuChannel(BaseChannel):
                 # Bound reaction cache size to avoid unbounded growth.
                 while len(self._reaction_ids) > 1000:
                     self._reaction_ids.popitem(last=False)
+            await self._create_processing_card_for_message(message_id, receive_id_type, reply_to)
 
             # Parse content
             content_parts = []
@@ -803,7 +930,6 @@ class FeishuChannel(BaseChannel):
                 return
 
             # Forward to message bus
-            reply_to = chat_id if chat_type == "group" else sender_id
             await self._handle_message(
                 sender_id=sender_id,
                 chat_id=reply_to,

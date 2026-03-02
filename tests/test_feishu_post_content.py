@@ -90,6 +90,8 @@ async def test_on_message_records_reaction_id_for_cleanup(monkeypatch) -> None:
     channel = _make_channel()
     channel._add_reaction = AsyncMock(return_value="reaction_1")
     channel._handle_message = AsyncMock()
+    create_card = AsyncMock()
+    monkeypatch.setattr(channel, "_create_processing_card_for_message", create_card)
 
     data = SimpleNamespace(
         event=SimpleNamespace(
@@ -110,6 +112,7 @@ async def test_on_message_records_reaction_id_for_cleanup(monkeypatch) -> None:
     await channel._on_message(data)
 
     assert channel._reaction_ids.get("om_1") == "reaction_1"
+    create_card.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -197,3 +200,64 @@ async def test_send_does_not_delete_reaction_without_turn_done(monkeypatch) -> N
 
     assert deleted == []
     assert channel._reaction_ids.get("om_4") == "reaction_4"
+
+
+@pytest.mark.asyncio
+async def test_send_progress_updates_card_without_sending_text(monkeypatch) -> None:
+    channel = _make_channel()
+    channel._processing_cards["om_p"] = "om_card_p"
+    channel._processing_card_text["om_p"] = "old"
+
+    sent_calls: list[tuple[str, str, str, str]] = []
+
+    def _fake_send(receive_id_type: str, receive_id: str, msg_type: str, content: str) -> str | None:
+        sent_calls.append((receive_id_type, receive_id, msg_type, content))
+        return "om_sent"
+
+    update = AsyncMock()
+    monkeypatch.setattr(channel, "_send_message_sync", _fake_send)
+    monkeypatch.setattr(channel, "_update_processing_card_for_message", update)
+
+    await channel.send(
+        OutboundMessage(
+            channel="feishu",
+            chat_id="ou_123",
+            content="thinking...",
+            metadata={"message_id": "om_p", "_progress": True},
+        )
+    )
+
+    update.assert_awaited_once()
+    assert sent_calls == []
+
+
+@pytest.mark.asyncio
+async def test_send_turn_done_cleans_card_and_reaction(monkeypatch) -> None:
+    channel = _make_channel()
+    channel._processing_cards["om_done"] = "om_card_done"
+    channel._reaction_ids["om_done"] = "reaction_done"
+
+    sent_calls: list[tuple[str, str, str, str]] = []
+
+    def _fake_send(receive_id_type: str, receive_id: str, msg_type: str, content: str) -> str | None:
+        sent_calls.append((receive_id_type, receive_id, msg_type, content))
+        return "om_sent"
+
+    del_card = AsyncMock()
+    del_reaction = AsyncMock()
+    monkeypatch.setattr(channel, "_send_message_sync", _fake_send)
+    monkeypatch.setattr(channel, "_delete_processing_card_for_message", del_card)
+    monkeypatch.setattr(channel, "_delete_reaction_for_message", del_reaction)
+
+    await channel.send(
+        OutboundMessage(
+            channel="feishu",
+            chat_id="ou_123",
+            content="final",
+            metadata={"message_id": "om_done", "_turn_done": True},
+        )
+    )
+
+    assert sent_calls and sent_calls[0][2] == "text"
+    del_card.assert_awaited_once_with("om_done")
+    del_reaction.assert_awaited_once_with("om_done")

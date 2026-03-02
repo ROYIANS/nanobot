@@ -268,6 +268,7 @@ class FeishuChannel(BaseChannel):
         self._ws_client: Any = None
         self._ws_thread: threading.Thread | None = None
         self._processed_message_ids: OrderedDict[str, None] = OrderedDict()  # Ordered dedup cache
+        self._reaction_ids: OrderedDict[str, str] = OrderedDict()  # message_id -> reaction_id
         self._loop: asyncio.AbstractEventLoop | None = None
 
     async def start(self) -> None:
@@ -338,7 +339,7 @@ class FeishuChannel(BaseChannel):
         self._running = False
         logger.info("Feishu bot stopped")
 
-    def _add_reaction_sync(self, message_id: str, emoji_type: str) -> None:
+    def _add_reaction_sync(self, message_id: str, emoji_type: str) -> str | None:
         """Sync helper for adding reaction (runs in thread pool)."""
         try:
             request = CreateMessageReactionRequest.builder() \
@@ -353,22 +354,67 @@ class FeishuChannel(BaseChannel):
 
             if not response.success():
                 logger.warning("Failed to add reaction: code={}, msg={}", response.code, response.msg)
+                return None
             else:
                 logger.debug("Added {} reaction to message {}", emoji_type, message_id)
+                return getattr(response.data, "reaction_id", None)
         except Exception as e:
             logger.warning("Error adding reaction: {}", e)
+            return None
 
-    async def _add_reaction(self, message_id: str, emoji_type: str = "THUMBSUP") -> None:
+    async def _add_reaction(self, message_id: str, emoji_type: str = "THUMBSUP") -> str | None:
         """
         Add a reaction emoji to a message (non-blocking).
 
         Common emoji types: THUMBSUP, OK, EYES, DONE, OnIt, HEART
         """
         if not self._client or not Emoji:
-            return
+            return None
 
         loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, self._add_reaction_sync, message_id, emoji_type)
+        return await loop.run_in_executor(None, self._add_reaction_sync, message_id, emoji_type)
+
+    def _delete_reaction_sync(self, message_id: str, reaction_id: str) -> None:
+        """Sync helper for deleting a reaction (runs in thread pool)."""
+        try:
+            try:
+                from lark_oapi.api.im.v1 import DeleteMessageReactionRequest
+            except ImportError:
+                logger.warning("DeleteMessageReactionRequest not available in current lark-oapi version")
+                return
+            request = DeleteMessageReactionRequest.builder() \
+                .message_id(message_id) \
+                .reaction_id(reaction_id) \
+                .build()
+            response = self._client.im.v1.message_reaction.delete(request)
+            if not response.success():
+                logger.warning(
+                    "Failed to delete reaction: message_id={}, reaction_id={}, code={}, msg={}",
+                    message_id, reaction_id, response.code, response.msg
+                )
+            else:
+                logger.debug("Deleted reaction {} from message {}", reaction_id, message_id)
+        except Exception as e:
+            logger.warning("Error deleting reaction {} from message {}: {}", reaction_id, message_id, e)
+
+    async def _delete_reaction(self, message_id: str, reaction_id: str) -> None:
+        """Delete a reaction emoji from a message (non-blocking)."""
+        if not self._client:
+            return
+        if not reaction_id:
+            return
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, self._delete_reaction_sync, message_id, reaction_id)
+
+    async def _delete_reaction_for_message(self, message_id: str) -> None:
+        """Delete and clear tracked reaction for an inbound message."""
+        reaction_id = self._reaction_ids.get(message_id)
+        if not reaction_id:
+            return
+        try:
+            await self._delete_reaction(message_id, reaction_id)
+        finally:
+            self._reaction_ids.pop(message_id, None)
 
     # Regex to match markdown tables (header + separator + data rows)
     _TABLE_RE = re.compile(
@@ -597,7 +643,7 @@ class FeishuChannel(BaseChannel):
         return None, f"[{msg_type}: download failed]"
 
     def _send_message_sync(self, receive_id_type: str, receive_id: str, msg_type: str, content: str) -> bool:
-        """Send a single message (text/image/file/interactive) synchronously."""
+        """Send a single message (text/image/file) synchronously."""
         try:
             request = CreateMessageRequest.builder() \
                 .receive_id_type(receive_id_type) \
@@ -630,6 +676,8 @@ class FeishuChannel(BaseChannel):
         try:
             receive_id_type = "chat_id" if msg.chat_id.startswith("oc_") else "open_id"
             loop = asyncio.get_running_loop()
+            source_message_id = str(msg.metadata.get("message_id", "")).strip()
+            is_turn_done = bool(msg.metadata.get("_turn_done"))
 
             for file_path in msg.media:
                 if not os.path.isfile(file_path):
@@ -653,11 +701,14 @@ class FeishuChannel(BaseChannel):
                         )
 
             if msg.content and msg.content.strip():
-                card = {"config": {"wide_screen_mode": True}, "elements": self._build_card_elements(msg.content)}
                 await loop.run_in_executor(
                     None, self._send_message_sync,
-                    receive_id_type, msg.chat_id, "interactive", json.dumps(card, ensure_ascii=False),
+                    receive_id_type, msg.chat_id, "text", json.dumps({"text": msg.content}, ensure_ascii=False),
                 )
+
+            # Only clear reaction when agent explicitly marks this turn as complete.
+            if source_message_id and is_turn_done:
+                await self._delete_reaction_for_message(source_message_id)
 
         except Exception as e:
             logger.error("Error sending Feishu message: {}", e)
@@ -696,8 +747,13 @@ class FeishuChannel(BaseChannel):
             chat_type = message.chat_type
             msg_type = message.message_type
 
-            # Add reaction
-            await self._add_reaction(message_id, self.config.react_emoji)
+            # Add reaction and track it for completion cleanup.
+            reaction_id = await self._add_reaction(message_id, self.config.react_emoji)
+            if reaction_id:
+                self._reaction_ids[message_id] = reaction_id
+                # Bound reaction cache size to avoid unbounded growth.
+                while len(self._reaction_ids) > 1000:
+                    self._reaction_ids.popitem(last=False)
 
             # Parse content
             content_parts = []

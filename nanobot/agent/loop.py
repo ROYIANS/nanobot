@@ -287,8 +287,11 @@ class AgentLoop:
         sub_cancelled = await self.subagents.cancel_by_session(msg.session_key)
         total = cancelled + sub_cancelled
         content = f"⏹ Stopped {total} task(s)." if total else "No active task to stop."
+        metadata = dict(msg.metadata or {})
+        if msg.channel == "feishu" and metadata.get("message_id"):
+            metadata["_turn_done"] = True
         await self.bus.publish_outbound(OutboundMessage(
-            channel=msg.channel, chat_id=msg.chat_id, content=content,
+            channel=msg.channel, chat_id=msg.chat_id, content=content, metadata=metadata,
         ))
 
     async def _dispatch(self, msg: InboundMessage) -> None:
@@ -297,7 +300,19 @@ class AgentLoop:
             try:
                 response = await self._process_message(msg)
                 if response is not None:
+                    if msg.channel == "feishu" and msg.metadata.get("message_id"):
+                        meta = dict(response.metadata or {})
+                        meta.setdefault("message_id", msg.metadata.get("message_id"))
+                        meta["_turn_done"] = True
+                        response.metadata = meta
                     await self.bus.publish_outbound(response)
+                elif msg.channel == "feishu" and msg.metadata.get("message_id"):
+                    meta = dict(msg.metadata or {})
+                    meta["_turn_done"] = True
+                    await self.bus.publish_outbound(OutboundMessage(
+                        channel=msg.channel, chat_id=msg.chat_id,
+                        content="", metadata=meta,
+                    ))
                 elif msg.channel == "cli":
                     await self.bus.publish_outbound(OutboundMessage(
                         channel=msg.channel, chat_id=msg.chat_id,
@@ -308,9 +323,13 @@ class AgentLoop:
                 raise
             except Exception:
                 logger.exception("Error processing message for session {}", msg.session_key)
+                metadata = {}
+                if msg.channel == "feishu" and msg.metadata.get("message_id"):
+                    metadata = dict(msg.metadata or {})
+                    metadata["_turn_done"] = True
                 await self.bus.publish_outbound(OutboundMessage(
                     channel=msg.channel, chat_id=msg.chat_id,
-                    content="Sorry, I encountered an error.",
+                    content="Sorry, I encountered an error.", metadata=metadata,
                 ))
 
     async def close_mcp(self) -> None:

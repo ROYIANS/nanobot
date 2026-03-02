@@ -101,3 +101,49 @@ class TestMessageToolTurnTracking:
         tool._sent_in_turn = True
         tool.start_turn()
         assert not tool._sent_in_turn
+
+
+class TestFeishuTurnDoneMetadata:
+    @pytest.mark.asyncio
+    async def test_dispatch_marks_turn_done_on_final_response(self, tmp_path: Path) -> None:
+        loop = _make_loop(tmp_path)
+        msg = InboundMessage(
+            channel="feishu",
+            sender_id="user1",
+            chat_id="chat123",
+            content="Hi",
+            metadata={"message_id": "om_1"},
+        )
+        loop._process_message = AsyncMock(
+            return_value=OutboundMessage(
+                channel="feishu",
+                chat_id="chat123",
+                content="Done",
+                metadata={},
+            )
+        )
+
+        await loop._dispatch(msg)
+        out = await loop.bus.consume_outbound()
+
+        assert out.metadata["message_id"] == "om_1"
+        assert out.metadata["_turn_done"] is True
+
+    @pytest.mark.asyncio
+    async def test_dispatch_emits_turn_done_signal_when_response_suppressed(self, tmp_path: Path) -> None:
+        loop = _make_loop(tmp_path)
+        msg = InboundMessage(
+            channel="feishu",
+            sender_id="user1",
+            chat_id="chat123",
+            content="Hi",
+            metadata={"message_id": "om_2"},
+        )
+        loop._process_message = AsyncMock(return_value=None)
+
+        await loop._dispatch(msg)
+        out = await loop.bus.consume_outbound()
+
+        assert out.content == ""
+        assert out.metadata["message_id"] == "om_2"
+        assert out.metadata["_turn_done"] is True

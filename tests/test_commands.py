@@ -110,6 +110,15 @@ def test_config_matches_openai_codex_with_hyphen_prefix():
     assert config.get_provider_name() == "openai_codex"
 
 
+def test_config_matches_ikuncode_when_explicit_provider_selected():
+    config = Config()
+    config.agents.defaults.provider = "ikuncode"
+    config.providers.ikuncode.api_key = "sk-ikuncode"
+
+    assert config.get_provider_name("gpt-4.1-mini") == "ikuncode"
+    assert config.get_api_base("gpt-4.1-mini") == "https://api.ikuncode.cc/v1"
+
+
 def test_find_by_model_prefers_explicit_prefix_over_generic_codex_keyword():
     spec = find_by_model("github-copilot/gpt-5.3-codex")
 

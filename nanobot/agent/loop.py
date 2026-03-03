@@ -593,6 +593,21 @@ class AgentLoop:
             self._set_active_task(session, task)
         self.sessions.save(session)
 
+        message_tool = self.tools.get("message")
+        if (
+            msg.channel == "feishu"
+            and isinstance(message_tool, MessageTool)
+            and message_tool._sent_in_turn
+        ):
+            task_status = str((task or {}).get("status") or "")
+            if task_status == "completed" or not task_status:
+                logger.info(
+                    "Suppressing final Feishu text reply for {}:{} because same-target message tool already sent content",
+                    msg.channel,
+                    msg.sender_id,
+                )
+                return None
+
         preview = final_content[:120] + "..." if len(final_content) > 120 else final_content
         logger.info("Response to {}:{}: {}", msg.channel, msg.sender_id, preview)
         return OutboundMessage(

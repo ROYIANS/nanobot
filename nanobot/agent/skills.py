@@ -8,6 +8,11 @@ from pathlib import Path
 
 # Default builtin skills directory (relative to this file)
 BUILTIN_SKILLS_DIR = Path(__file__).parent.parent / "skills"
+DEFAULT_SUPERPOWERS_SKILL_DIRS = (
+    Path.home() / ".codex" / "superpowers" / "skills",
+    Path.home() / ".codex" / "skills" / ".system",
+)
+EXTRA_SKILL_DIRS_ENV = "NANOBOT_SKILLS_EXTRA_DIRS"
 
 
 class SkillsLoader:
@@ -23,6 +28,59 @@ class SkillsLoader:
         self.workspace_skills = workspace / "skills"
         self.builtin_skills = builtin_skills_dir or BUILTIN_SKILLS_DIR
 
+    @staticmethod
+    def _parse_extra_dirs_from_env() -> list[Path]:
+        """Parse additional skill roots from env var (os.pathsep-separated)."""
+        raw = os.environ.get(EXTRA_SKILL_DIRS_ENV, "")
+        if not raw.strip():
+            return []
+        out: list[Path] = []
+        for chunk in raw.split(os.pathsep):
+            path = chunk.strip()
+            if path:
+                out.append(Path(path).expanduser())
+        return out
+
+    def _iter_skill_roots(self) -> list[tuple[str, Path]]:
+        """Return ordered skill roots with source labels."""
+        roots: list[tuple[str, Path]] = []
+        if self.workspace_skills.exists():
+            roots.append(("workspace", self.workspace_skills))
+        if self.builtin_skills and self.builtin_skills.exists():
+            roots.append(("builtin", self.builtin_skills))
+
+        for root in DEFAULT_SUPERPOWERS_SKILL_DIRS:
+            if root.exists():
+                roots.append(("superpowers", root))
+        for root in self._parse_extra_dirs_from_env():
+            if root.exists():
+                roots.append(("external", root))
+        return roots
+
+    @staticmethod
+    def _iter_skill_files(root: Path):
+        """Iterate SKILL.md files recursively in a stable order."""
+        try:
+            files = sorted(root.rglob("SKILL.md"), key=lambda p: str(p))
+        except Exception:
+            return []
+        return [p for p in files if p.is_file()]
+
+    def _discover_skills(self) -> list[dict[str, str]]:
+        """Discover skills from all configured roots with precedence."""
+        skills: list[dict[str, str]] = []
+        seen_names: set[str] = set()
+        for source, root in self._iter_skill_roots():
+            for skill_file in self._iter_skill_files(root):
+                skill_name = skill_file.parent.name
+                if skill_name in seen_names:
+                    continue
+                seen_names.add(skill_name)
+                skills.append(
+                    {"name": skill_name, "path": str(skill_file), "source": source}
+                )
+        return skills
+
     def list_skills(self, filter_unavailable: bool = True) -> list[dict[str, str]]:
         """
         List all available skills.
@@ -33,23 +91,7 @@ class SkillsLoader:
         Returns:
             List of skill info dicts with 'name', 'path', 'source'.
         """
-        skills = []
-
-        # Workspace skills (highest priority)
-        if self.workspace_skills.exists():
-            for skill_dir in self.workspace_skills.iterdir():
-                if skill_dir.is_dir():
-                    skill_file = skill_dir / "SKILL.md"
-                    if skill_file.exists():
-                        skills.append({"name": skill_dir.name, "path": str(skill_file), "source": "workspace"})
-
-        # Built-in skills
-        if self.builtin_skills and self.builtin_skills.exists():
-            for skill_dir in self.builtin_skills.iterdir():
-                if skill_dir.is_dir():
-                    skill_file = skill_dir / "SKILL.md"
-                    if skill_file.exists() and not any(s["name"] == skill_dir.name for s in skills):
-                        skills.append({"name": skill_dir.name, "path": str(skill_file), "source": "builtin"})
+        skills = self._discover_skills()
 
         # Filter by requirements
         if filter_unavailable:
@@ -66,16 +108,12 @@ class SkillsLoader:
         Returns:
             Skill content or None if not found.
         """
-        # Check workspace first
-        workspace_skill = self.workspace_skills / name / "SKILL.md"
-        if workspace_skill.exists():
-            return workspace_skill.read_text(encoding="utf-8")
-
-        # Check built-in
-        if self.builtin_skills:
-            builtin_skill = self.builtin_skills / name / "SKILL.md"
-            if builtin_skill.exists():
-                return builtin_skill.read_text(encoding="utf-8")
+        for skill in self._discover_skills():
+            if skill["name"] != name:
+                continue
+            skill_path = Path(skill["path"])
+            if skill_path.exists():
+                return skill_path.read_text(encoding="utf-8")
 
         return None
 

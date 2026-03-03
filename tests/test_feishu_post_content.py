@@ -117,6 +117,36 @@ async def test_on_message_records_reaction_id_for_cleanup(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
+async def test_on_message_skips_processing_card_for_slash_command(monkeypatch) -> None:
+    channel = _make_channel()
+    channel._add_reaction = AsyncMock(return_value="reaction_cmd")
+    channel._handle_message = AsyncMock()
+    create_card = AsyncMock()
+    monkeypatch.setattr(channel, "_create_processing_card_for_message", create_card)
+
+    data = SimpleNamespace(
+        event=SimpleNamespace(
+            message=SimpleNamespace(
+                message_id="om_cmd_1",
+                chat_id="oc_group",
+                chat_type="group",
+                message_type="text",
+                content=json.dumps({"text": "/new"}),
+            ),
+            sender=SimpleNamespace(
+                sender_type="user",
+                sender_id=SimpleNamespace(open_id="ou_user"),
+            ),
+        )
+    )
+
+    await channel._on_message(data)
+
+    assert channel._reaction_ids.get("om_cmd_1") == "reaction_cmd"
+    create_card.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_send_deletes_reaction_after_final_reply(monkeypatch) -> None:
     channel = _make_channel()
     channel._reaction_ids["om_2"] = "reaction_2"
@@ -230,6 +260,56 @@ async def test_send_progress_updates_card_without_sending_text(monkeypatch) -> N
 
     update.assert_awaited_once()
     assert sent_calls == []
+
+
+@pytest.mark.asyncio
+async def test_update_processing_card_appends_logs_instead_of_overwrite(monkeypatch) -> None:
+    channel = _make_channel()
+    channel._processing_cards["om_append"] = "om_card_append"
+    channel._processing_card_logs["om_append"] = []
+    channel._processing_card_step["om_append"] = 0
+
+    payloads: list[dict] = []
+
+    def _fake_update(_message_id: str, _msg_type: str, content: str) -> bool:
+        payloads.append(json.loads(content))
+        return True
+
+    monkeypatch.setattr(channel, "_update_message_sync", _fake_update)
+
+    await channel._update_processing_card_for_message("om_append", "处理文件 A")
+    await channel._update_processing_card_for_message("om_append", "调用工具 read_file")
+
+    assert channel._processing_card_logs["om_append"] == ["处理文件 A", "调用工具 read_file"]
+    assert len(payloads) == 2
+    logs_md = payloads[-1]["elements"][-1]["content"]
+    assert "> 处理文件 A" in logs_md
+    assert "> 调用工具 read_file" in logs_md
+
+
+@pytest.mark.asyncio
+async def test_update_processing_card_uses_dynamic_thinking_dots(monkeypatch) -> None:
+    channel = _make_channel()
+    channel._processing_cards["om_dot"] = "om_card_dot"
+    channel._processing_card_logs["om_dot"] = []
+    channel._processing_card_step["om_dot"] = 0
+
+    status_lines: list[str] = []
+
+    def _fake_update(_message_id: str, _msg_type: str, content: str) -> bool:
+        payload = json.loads(content)
+        status_lines.append(payload["elements"][0]["content"])
+        return True
+
+    monkeypatch.setattr(channel, "_update_message_sync", _fake_update)
+
+    await channel._update_processing_card_for_message("om_dot", "first")
+    await channel._update_processing_card_for_message("om_dot", "second")
+
+    assert len(status_lines) == 2
+    assert status_lines[0].startswith("> 正在思考")
+    assert status_lines[1].startswith("> 正在思考")
+    assert status_lines[0] != status_lines[1]
 
 
 @pytest.mark.asyncio

@@ -273,7 +273,10 @@ class FeishuChannel(BaseChannel):
         self._processed_message_ids: OrderedDict[str, None] = OrderedDict()  # Ordered dedup cache
         self._reaction_ids: OrderedDict[str, str] = OrderedDict()  # message_id -> reaction_id
         self._processing_cards: OrderedDict[str, str] = OrderedDict()  # source message_id -> card message_id
-        self._processing_card_text: OrderedDict[str, str] = OrderedDict()  # source message_id -> latest text
+        self._processing_card_text: OrderedDict[str, str] = OrderedDict()  # source message_id -> latest render key
+        self._processing_card_logs: OrderedDict[str, list[str]] = OrderedDict()  # source message_id -> appended logs
+        self._processing_card_step: OrderedDict[str, int] = OrderedDict()  # source message_id -> dot animation step
+        self._processing_card_animators: dict[str, asyncio.Task[None]] = {}
         self._loop: asyncio.AbstractEventLoop | None = None
 
     async def start(self) -> None:
@@ -422,19 +425,70 @@ class FeishuChannel(BaseChannel):
             self._reaction_ids.pop(message_id, None)
 
     @staticmethod
-    def _build_processing_card(progress_text: str) -> dict:
+    def _build_processing_card(progress_text: str, logs: list[str] | None = None) -> dict:
         """Build a lightweight progress card for one turn."""
-        text = (progress_text or "").strip() or "正在分析你的问题…"
+        status = (progress_text or "").strip() or "正在思考."
+        log_lines = [line.strip() for line in (logs or []) if str(line).strip()]
+        status_quote = f"> {status}"
+        logs_quote = "\n".join(f"> {line}" for line in log_lines) if log_lines else ""
+
+        elements: list[dict[str, Any]] = [{"tag": "markdown", "content": status_quote}]
+        if logs_quote:
+            elements.append({"tag": "markdown", "content": logs_quote})
+
         return {
             "config": {"wide_screen_mode": True, "update_multi": True},
             "header": {
                 "title": {"tag": "plain_text", "content": "Nanobot 正在处理中"},
                 "template": "blue",
             },
-            "elements": [
-                {"tag": "markdown", "content": text},
-            ],
+            "elements": elements,
         }
+
+    @staticmethod
+    def _thinking_text(step: int) -> str:
+        dots = "." * ((step % 3) + 1)
+        return f"正在思考{dots}"
+
+    def _render_key(self, status: str, logs: list[str]) -> str:
+        return status + "\n" + "\n".join(logs)
+
+    async def _render_processing_card(self, source_message_id: str, *, force: bool = False) -> None:
+        card_message_id = self._processing_cards.get(source_message_id)
+        if not card_message_id:
+            return
+        logs = list(self._processing_card_logs.get(source_message_id, []))
+        step = int(self._processing_card_step.get(source_message_id, 0))
+        status = self._thinking_text(step)
+        render_key = self._render_key(status, logs)
+        if not force and self._processing_card_text.get(source_message_id) == render_key:
+            return
+
+        card = self._build_processing_card(status, logs)
+        loop = asyncio.get_running_loop()
+        ok = await loop.run_in_executor(
+            None,
+            self._update_message_sync,
+            card_message_id,
+            "interactive",
+            json.dumps(card, ensure_ascii=False),
+        )
+        if ok:
+            self._processing_card_text[source_message_id] = render_key
+
+    async def _animate_processing_card(self, source_message_id: str) -> None:
+        """Keep lightweight dot animation while the card is alive."""
+        try:
+            while source_message_id in self._processing_cards:
+                await asyncio.sleep(1.0)
+                if source_message_id not in self._processing_cards:
+                    break
+                self._processing_card_step[source_message_id] = int(
+                    self._processing_card_step.get(source_message_id, 0)
+                ) + 1
+                await self._render_processing_card(source_message_id)
+        except asyncio.CancelledError:
+            return
 
     def _update_message_sync(self, message_id: str, msg_type: str, content: str) -> bool:
         """Sync helper for updating an existing message."""
@@ -481,7 +535,10 @@ class FeishuChannel(BaseChannel):
         """Create a process card for one inbound message if absent."""
         if not source_message_id or source_message_id in self._processing_cards:
             return
-        card = self._build_processing_card("正在思考…")
+        self._processing_card_logs[source_message_id] = []
+        self._processing_card_step[source_message_id] = 0
+        status = self._thinking_text(0)
+        card = self._build_processing_card(status, [])
         loop = asyncio.get_running_loop()
         card_message_id = await loop.run_in_executor(
             None,
@@ -493,32 +550,33 @@ class FeishuChannel(BaseChannel):
         )
         if card_message_id:
             self._processing_cards[source_message_id] = card_message_id
-            self._processing_card_text[source_message_id] = "正在思考…"
+            self._processing_card_text[source_message_id] = self._render_key(status, [])
+            self._processing_card_animators[source_message_id] = asyncio.create_task(
+                self._animate_processing_card(source_message_id)
+            )
             while len(self._processing_cards) > 1000:
                 old_key, _ = self._processing_cards.popitem(last=False)
                 self._processing_card_text.pop(old_key, None)
+                self._processing_card_logs.pop(old_key, None)
+                self._processing_card_step.pop(old_key, None)
+                animator = self._processing_card_animators.pop(old_key, None)
+                if animator:
+                    animator.cancel()
 
     async def _update_processing_card_for_message(self, source_message_id: str, progress_text: str) -> None:
-        """Update the process card content for one inbound message."""
-        card_message_id = self._processing_cards.get(source_message_id)
-        if not card_message_id:
+        """Append progress logs and update process card for one inbound message."""
+        if source_message_id not in self._processing_cards:
             return
         normalized = (progress_text or "").strip()
         if not normalized:
             return
-        if self._processing_card_text.get(source_message_id) == normalized:
-            return
-        card = self._build_processing_card(normalized)
-        loop = asyncio.get_running_loop()
-        ok = await loop.run_in_executor(
-            None,
-            self._update_message_sync,
-            card_message_id,
-            "interactive",
-            json.dumps(card, ensure_ascii=False),
-        )
-        if ok:
-            self._processing_card_text[source_message_id] = normalized
+        logs = self._processing_card_logs.setdefault(source_message_id, [])
+        if not logs or logs[-1] != normalized:
+            logs.append(normalized)
+        self._processing_card_step[source_message_id] = int(
+            self._processing_card_step.get(source_message_id, 0)
+        ) + 1
+        await self._render_processing_card(source_message_id)
 
     async def _delete_processing_card_for_message(self, source_message_id: str) -> None:
         """Delete and clear process card for one inbound message."""
@@ -531,6 +589,11 @@ class FeishuChannel(BaseChannel):
         finally:
             self._processing_cards.pop(source_message_id, None)
             self._processing_card_text.pop(source_message_id, None)
+            self._processing_card_logs.pop(source_message_id, None)
+            self._processing_card_step.pop(source_message_id, None)
+            animator = self._processing_card_animators.pop(source_message_id, None)
+            if animator:
+                animator.cancel()
 
     # Regex to match markdown tables (header + separator + data rows)
     _TABLE_RE = re.compile(
@@ -968,6 +1031,13 @@ class FeishuChannel(BaseChannel):
             reply_to = chat_id if chat_type == "group" else sender_id
             receive_id_type = "chat_id" if reply_to.startswith("oc_") else "open_id"
 
+            try:
+                content_json = json.loads(message.content) if message.content else {}
+            except json.JSONDecodeError:
+                content_json = {}
+            text_content = str(content_json.get("text", "")).strip() if msg_type == "text" else ""
+            is_slash_command = bool(text_content.startswith("/"))
+
             # Add reaction and track it for completion cleanup.
             reaction_id = await self._add_reaction(message_id, self.config.react_emoji)
             if reaction_id:
@@ -975,16 +1045,12 @@ class FeishuChannel(BaseChannel):
                 # Bound reaction cache size to avoid unbounded growth.
                 while len(self._reaction_ids) > 1000:
                     self._reaction_ids.popitem(last=False)
-            await self._create_processing_card_for_message(message_id, receive_id_type, reply_to)
+            if not is_slash_command:
+                await self._create_processing_card_for_message(message_id, receive_id_type, reply_to)
 
             # Parse content
             content_parts = []
             media_paths = []
-
-            try:
-                content_json = json.loads(message.content) if message.content else {}
-            except json.JSONDecodeError:
-                content_json = {}
 
             if msg_type == "text":
                 text = content_json.get("text", "")

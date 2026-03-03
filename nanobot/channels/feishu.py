@@ -793,6 +793,8 @@ class FeishuChannel(BaseChannel):
             is_turn_done = bool(msg.metadata.get("_turn_done"))
             is_progress = bool(msg.metadata.get("_progress"))
             is_tool_hint = bool(msg.metadata.get("_tool_hint"))
+            force_msg_type = str(msg.metadata.get("feishu_msg_type", "")).strip().lower()
+            force_system_content = msg.metadata.get("feishu_system_content")
 
             if is_progress:
                 if source_message_id:
@@ -821,7 +823,19 @@ class FeishuChannel(BaseChannel):
                             receive_id_type, msg.chat_id, media_type, json.dumps({"file_key": key}, ensure_ascii=False),
                         )
 
-            if msg.content and msg.content.strip():
+            if force_msg_type == "system" and force_system_content is not None:
+                payload = force_system_content
+                if not isinstance(payload, str):
+                    payload = json.dumps(payload, ensure_ascii=False)
+                await loop.run_in_executor(
+                    None,
+                    self._send_message_sync,
+                    receive_id_type,
+                    msg.chat_id,
+                    "system",
+                    payload,
+                )
+            elif msg.content and msg.content.strip():
                 await loop.run_in_executor(
                     None, self._send_message_sync,
                     receive_id_type, msg.chat_id, "text", json.dumps({"text": msg.content}, ensure_ascii=False),

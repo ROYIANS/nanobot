@@ -406,6 +406,27 @@ class AgentLoop:
             session.clear()
             self.sessions.save(session)
             self.sessions.invalidate(session.key)
+            if msg.channel == "feishu":
+                meta = dict(msg.metadata or {})
+                meta["feishu_msg_type"] = "system"
+                meta["feishu_system_content"] = {
+                    "type": "divider",
+                    "params": {
+                        "divider_text": {
+                            "text": "新会话",
+                            "i18n_text": {
+                                "zh_CN": "新会话",
+                                "en_US": "New Session",
+                            },
+                        },
+                    },
+                    "options": {
+                        "need_rollup": True,
+                    },
+                }
+                return OutboundMessage(
+                    channel=msg.channel, chat_id=msg.chat_id, content="", metadata=meta
+                )
             return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
                                   content="New session started.")
         if cmd == "/help":

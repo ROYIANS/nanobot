@@ -264,6 +264,44 @@ async def test_send_turn_done_cleans_card_and_reaction(monkeypatch) -> None:
     del_reaction.assert_awaited_once_with("om_done")
 
 
+@pytest.mark.asyncio
+async def test_send_system_divider_message_from_metadata(monkeypatch) -> None:
+    channel = _make_channel()
+    sent_calls: list[tuple[str, str, str, str]] = []
+
+    def _fake_send(receive_id_type: str, receive_id: str, msg_type: str, content: str) -> str | None:
+        sent_calls.append((receive_id_type, receive_id, msg_type, content))
+        return "om_system"
+
+    monkeypatch.setattr(channel, "_send_message_sync", _fake_send)
+
+    payload = {
+        "type": "divider",
+        "params": {
+            "divider_text": {
+                "text": "新会话",
+                "i18n_text": {"zh_CN": "新会话", "en_US": "New Session"},
+            }
+        },
+        "options": {"need_rollup": True},
+    }
+    await channel.send(
+        OutboundMessage(
+            channel="feishu",
+            chat_id="ou_123",
+            content="New session started.",
+            metadata={
+                "feishu_msg_type": "system",
+                "feishu_system_content": payload,
+            },
+        )
+    )
+
+    assert len(sent_calls) == 1
+    assert sent_calls[0][2] == "system"
+    assert json.loads(sent_calls[0][3]) == payload
+
+
 def test_update_message_sync_supports_patch_body_without_msg_type(monkeypatch) -> None:
     channel = _make_channel()
 

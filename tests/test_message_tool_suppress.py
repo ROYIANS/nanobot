@@ -147,3 +147,30 @@ class TestFeishuTurnDoneMetadata:
         assert out.content == ""
         assert out.metadata["message_id"] == "om_2"
         assert out.metadata["_turn_done"] is True
+
+
+class TestFeishuNewSessionSystemMessage:
+    @pytest.mark.asyncio
+    async def test_new_returns_feishu_system_divider_payload(self, tmp_path: Path) -> None:
+        loop = _make_loop(tmp_path)
+
+        async def _ok_consolidate(_session, archive_all: bool = False) -> bool:
+            return True
+
+        loop._consolidate_memory = _ok_consolidate  # type: ignore[method-assign]
+
+        msg = InboundMessage(
+            channel="feishu",
+            sender_id="user1",
+            chat_id="chat123",
+            content="/new",
+            metadata={"message_id": "om_new_1"},
+        )
+        response = await loop._process_message(msg)
+
+        assert response is not None
+        assert response.content == ""
+        assert response.metadata["feishu_msg_type"] == "system"
+        payload = response.metadata["feishu_system_content"]
+        assert payload["type"] == "divider"
+        assert payload["params"]["divider_text"]["i18n_text"]["en_US"] == "New Session"

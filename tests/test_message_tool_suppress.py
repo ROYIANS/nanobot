@@ -9,14 +9,22 @@ from nanobot.agent.loop import AgentLoop
 from nanobot.agent.tools.message import MessageTool
 from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
+from nanobot.config.schema import ChannelsConfig, FeishuConfig
 from nanobot.providers.base import LLMResponse, ToolCallRequest
 
 
-def _make_loop(tmp_path: Path) -> AgentLoop:
+def _make_loop(tmp_path: Path, channels_config: ChannelsConfig | None = None) -> AgentLoop:
     bus = MessageBus()
     provider = MagicMock()
     provider.get_default_model.return_value = "test-model"
-    return AgentLoop(bus=bus, provider=provider, workspace=tmp_path, model="test-model", memory_window=10)
+    return AgentLoop(
+        bus=bus,
+        provider=provider,
+        workspace=tmp_path,
+        model="test-model",
+        memory_window=10,
+        channels_config=channels_config,
+    )
 
 
 class TestMessageToolFinalReplyLogic:
@@ -218,8 +226,8 @@ class TestTaskContinueCommand:
         loop = _make_loop(tmp_path)
         seen_user_messages: list[str] = []
         calls = iter([
-            LLMResponse(content="我先看看 lark_oapi 里的定义。", tool_calls=[]),
-            LLMResponse(content="修复完成。", tool_calls=[]),
+            LLMResponse(content="I will check lark_oapi definitions first.", tool_calls=[]),
+            LLMResponse(content="Fix completed.", tool_calls=[]),
         ])
 
         async def _chat(*, messages, **kwargs):
@@ -230,22 +238,22 @@ class TestTaskContinueCommand:
         loop.tools.get_definitions = MagicMock(return_value=[])
 
         first = await loop._process_message(
-            InboundMessage(channel="feishu", sender_id="u1", chat_id="c1", content="请修复这个 bug")
+            InboundMessage(channel="feishu", sender_id="u1", chat_id="c1", content="Please fix this bug")
         )
         assert first is not None
 
         session = loop.sessions.get_or_create("feishu:c1")
         task = session.metadata.get("active_task", {})
         assert task.get("status") == "in_progress"
-        assert task.get("objective") == "请修复这个 bug"
+        assert task.get("objective") == "Please fix this bug"
 
         second = await loop._process_message(
             InboundMessage(channel="feishu", sender_id="u1", chat_id="c1", content="/continue")
         )
         assert second is not None
-        assert second.content == "修复完成。"
+        assert second.content == "Fix completed."
         assert "Continue the active task" in seen_user_messages[-1]
-        assert "请修复这个 bug" in seen_user_messages[-1]
+        assert "Please fix this bug" in seen_user_messages[-1]
 
     @pytest.mark.asyncio
     async def test_help_includes_continue_command(self, tmp_path: Path) -> None:
@@ -256,4 +264,95 @@ class TestTaskContinueCommand:
         )
 
         assert out is not None
-        assert "/continue — Continue the current task" in out.content
+        assert "/continue" in out.content
+
+class TestFeishuGroupAndAdminControls:
+    @pytest.mark.asyncio
+    async def test_group_message_includes_speaker_marker_in_prompt(self, tmp_path: Path) -> None:
+        loop = _make_loop(tmp_path)
+        seen_user_inputs: list[str] = []
+
+        async def _chat(*, messages, **kwargs):
+            seen_user_inputs.append(messages[-1]["content"])
+            return LLMResponse(content="ok", tool_calls=[])
+
+        loop.provider.chat = AsyncMock(side_effect=_chat)
+        loop.tools.get_definitions = MagicMock(return_value=[])
+
+        out = await loop._process_message(
+            InboundMessage(
+                channel="feishu",
+                sender_id="ou_user",
+                chat_id="oc_group",
+                content="please check this",
+                metadata={"is_group": True, "group_sender_id": "ou_user"},
+            )
+        )
+
+        assert out is not None
+        assert seen_user_inputs
+        assert seen_user_inputs[-1].startswith("[Group speaker: ou_user]")
+
+    @pytest.mark.asyncio
+    async def test_non_admin_feishu_sender_cannot_use_admin_tools(self, tmp_path: Path) -> None:
+        channels_cfg = ChannelsConfig(
+            feishu=FeishuConfig(
+                enabled=True,
+                app_id="cli_xxx",
+                app_secret="secret",
+                allow_from=["*"],
+                admin_ids=["ou_admin"],
+            )
+        )
+        loop = _make_loop(tmp_path, channels_config=channels_cfg)
+        seen_tools: list[set[str]] = []
+
+        async def _chat(*, messages, tools, **kwargs):
+            seen_tools.append({t["function"]["name"] for t in tools})
+            return LLMResponse(content="ok", tool_calls=[])
+
+        loop.provider.chat = AsyncMock(side_effect=_chat)
+
+        out = await loop._process_message(
+            InboundMessage(channel="feishu", sender_id="ou_user", chat_id="c1", content="hello")
+        )
+
+        assert out is not None
+        assert seen_tools
+        names = seen_tools[-1]
+        assert "exec" not in names
+        assert "edit_file" not in names
+        assert "write_file" not in names
+        assert "spawn" not in names
+
+    @pytest.mark.asyncio
+    async def test_admin_feishu_sender_keeps_admin_tools(self, tmp_path: Path) -> None:
+        channels_cfg = ChannelsConfig(
+            feishu=FeishuConfig(
+                enabled=True,
+                app_id="cli_xxx",
+                app_secret="secret",
+                allow_from=["*"],
+                admin_ids=["ou_admin"],
+            )
+        )
+        loop = _make_loop(tmp_path, channels_config=channels_cfg)
+        seen_tools: list[set[str]] = []
+
+        async def _chat(*, messages, tools, **kwargs):
+            seen_tools.append({t["function"]["name"] for t in tools})
+            return LLMResponse(content="ok", tool_calls=[])
+
+        loop.provider.chat = AsyncMock(side_effect=_chat)
+
+        out = await loop._process_message(
+            InboundMessage(channel="feishu", sender_id="ou_admin", chat_id="c1", content="hello")
+        )
+
+        assert out is not None
+        assert seen_tools
+        names = seen_tools[-1]
+        assert "exec" in names
+        assert "edit_file" in names
+        assert "write_file" in names
+

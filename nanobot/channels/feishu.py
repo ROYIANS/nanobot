@@ -3,6 +3,7 @@
 import asyncio
 import json
 import os
+import random
 import re
 import subprocess
 import threading
@@ -263,6 +264,7 @@ class FeishuChannel(BaseChannel):
     name = "feishu"
     _MAX_UPLOAD_FILE_BYTES = 30 * 1024 * 1024
     _NON_OPUS_AUDIO_EXTS = {".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg", ".amr"}
+    _AT_USER_ID_RE = re.compile(r"<at\b[^>]*\buser_id\s*=\s*[\"']([^\"']+)[\"'][^>]*>", re.IGNORECASE)
 
     def __init__(self, config: FeishuConfig, bus: MessageBus):
         super().__init__(config, bus)
@@ -995,6 +997,106 @@ class FeishuChannel(BaseChannel):
         except Exception as e:
             logger.error("Error sending Feishu message: {}", e)
 
+    @classmethod
+    def _extract_text_at_user_ids(cls, text: str) -> set[str]:
+        if not text:
+            return set()
+        return {m.group(1).strip() for m in cls._AT_USER_ID_RE.finditer(text) if m.group(1).strip()}
+
+    @classmethod
+    def _extract_json_at_user_ids(cls, obj: Any) -> set[str]:
+        ids: set[str] = set()
+        if isinstance(obj, dict):
+            tag = str(obj.get("tag", "")).lower()
+            if tag == "at":
+                uid = str(obj.get("user_id", "")).strip()
+                if uid:
+                    ids.add(uid)
+            for value in obj.values():
+                ids.update(cls._extract_json_at_user_ids(value))
+        elif isinstance(obj, list):
+            for item in obj:
+                ids.update(cls._extract_json_at_user_ids(item))
+        return ids
+
+    @staticmethod
+    def _extract_sdk_mention_ids(message: Any) -> set[str]:
+        ids: set[str] = set()
+        mentions = getattr(message, "mentions", None)
+        if not isinstance(mentions, list):
+            return ids
+
+        for mention in mentions:
+            if mention is None:
+                continue
+            # Common SDK shapes: mention.id.open_id / mention.id.user_id / mention.open_id / mention.user_id
+            mention_id = getattr(mention, "id", None)
+            for raw in (
+                getattr(mention_id, "open_id", None),
+                getattr(mention_id, "user_id", None),
+                getattr(mention_id, "union_id", None),
+                getattr(mention, "open_id", None),
+                getattr(mention, "user_id", None),
+                getattr(mention, "union_id", None),
+                getattr(mention, "key", None),
+            ):
+                value = str(raw or "").strip()
+                if value:
+                    ids.add(value)
+        return ids
+
+    def _extract_mentioned_user_ids(self, message: Any, msg_type: str, content_json: dict) -> set[str]:
+        ids = self._extract_sdk_mention_ids(message)
+        if msg_type == "text":
+            ids.update(self._extract_text_at_user_ids(str(content_json.get("text", ""))))
+        elif msg_type == "post":
+            ids.update(self._extract_json_at_user_ids(content_json))
+        return ids
+
+    def _is_group_allowed(self, chat_id: str) -> bool:
+        policy = str(self.config.group_policy or "mention").lower()
+        if policy == "allowlist":
+            return chat_id in (self.config.group_allow_from or [])
+        return True
+
+    def _should_respond_in_group(
+        self,
+        *,
+        chat_id: str,
+        message: Any,
+        msg_type: str,
+        content_json: dict,
+    ) -> tuple[bool, bool, bool]:
+        """Return (should_reply, was_mentioned, proactive_hit)."""
+        policy = str(self.config.group_policy or "mention").lower()
+
+        if policy == "allowlist":
+            return self._is_group_allowed(chat_id), False, False
+        if policy == "open":
+            return True, False, False
+
+        mentioned_ids = self._extract_mentioned_user_ids(message, msg_type, content_json)
+        bot_open_id = str(self.config.bot_open_id or "").strip()
+        if bot_open_id:
+            was_mentioned = bot_open_id in mentioned_ids
+        else:
+            # Fallback: when bot_open_id is unknown, treat any explicit @ as mention trigger.
+            was_mentioned = any(uid and uid != "all" for uid in mentioned_ids)
+
+        if not was_mentioned and self.config.allow_room_mentions and "all" in mentioned_ids:
+            was_mentioned = True
+
+        if was_mentioned:
+            return True, True, False
+
+        try:
+            p = float(self.config.proactive_reply_probability or 0.0)
+        except Exception:
+            p = 0.0
+        p = max(0.0, min(1.0, p))
+        proactive_hit = p > 0.0 and random.random() < p
+        return proactive_hit, False, proactive_hit
+
     def _on_message_sync(self, data: "P2ImMessageReceiveV1") -> None:
         """
         Sync handler for incoming messages (called from WebSocket thread).
@@ -1028,7 +1130,8 @@ class FeishuChannel(BaseChannel):
             chat_id = message.chat_id
             chat_type = message.chat_type
             msg_type = message.message_type
-            reply_to = chat_id if chat_type == "group" else sender_id
+            is_group = chat_type == "group"
+            reply_to = chat_id if is_group else sender_id
             receive_id_type = "chat_id" if reply_to.startswith("oc_") else "open_id"
 
             try:
@@ -1037,6 +1140,22 @@ class FeishuChannel(BaseChannel):
                 content_json = {}
             text_content = str(content_json.get("text", "")).strip() if msg_type == "text" else ""
             is_slash_command = bool(text_content.startswith("/"))
+            was_mentioned = False
+            proactive_reply = False
+
+            if is_group:
+                if is_slash_command:
+                    if not self._is_group_allowed(chat_id):
+                        return
+                else:
+                    should_reply, was_mentioned, proactive_reply = self._should_respond_in_group(
+                        chat_id=chat_id,
+                        message=message,
+                        msg_type=msg_type,
+                        content_json=content_json,
+                    )
+                    if not should_reply:
+                        return
 
             # Add reaction and track it for completion cleanup.
             reaction_id = await self._add_reaction(message_id, self.config.react_emoji)
@@ -1100,6 +1219,10 @@ class FeishuChannel(BaseChannel):
                     "message_id": message_id,
                     "chat_type": chat_type,
                     "msg_type": msg_type,
+                    "is_group": is_group,
+                    "group_sender_id": sender_id if is_group else "",
+                    "was_mentioned": was_mentioned,
+                    "proactive_reply": proactive_reply,
                 }
             )
 

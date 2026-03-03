@@ -56,6 +56,7 @@ def _make_channel() -> FeishuChannel:
         app_id="cli_test",
         app_secret="secret",
         allow_from=["*"],
+        group_policy="open",
     )
     channel = FeishuChannel(cfg, MessageBus())
     channel._client = object()  # bypass uninitialized client guard in send()
@@ -144,6 +145,114 @@ async def test_on_message_skips_processing_card_for_slash_command(monkeypatch) -
 
     assert channel._reaction_ids.get("om_cmd_1") == "reaction_cmd"
     create_card.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_on_message_group_mention_policy_ignores_non_mention(monkeypatch) -> None:
+    channel = _make_channel()
+    channel.config.group_policy = "mention"
+    channel.config.bot_open_id = "ou_bot"
+    channel.config.proactive_reply_probability = 0.0
+    channel._add_reaction = AsyncMock(return_value="reaction_ignored")
+    channel._handle_message = AsyncMock()
+    create_card = AsyncMock()
+    monkeypatch.setattr(channel, "_create_processing_card_for_message", create_card)
+
+    data = SimpleNamespace(
+        event=SimpleNamespace(
+            message=SimpleNamespace(
+                message_id="om_group_ignored",
+                chat_id="oc_group",
+                chat_type="group",
+                message_type="text",
+                content=json.dumps({"text": "just chatting"}),
+            ),
+            sender=SimpleNamespace(
+                sender_type="user",
+                sender_id=SimpleNamespace(open_id="ou_user"),
+            ),
+        )
+    )
+
+    await channel._on_message(data)
+
+    channel._add_reaction.assert_not_awaited()
+    create_card.assert_not_awaited()
+    channel._handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_on_message_group_mention_policy_replies_when_bot_is_mentioned(monkeypatch) -> None:
+    channel = _make_channel()
+    channel.config.group_policy = "mention"
+    channel.config.bot_open_id = "ou_bot"
+    channel._add_reaction = AsyncMock(return_value="reaction_mention")
+    channel._handle_message = AsyncMock()
+    create_card = AsyncMock()
+    monkeypatch.setattr(channel, "_create_processing_card_for_message", create_card)
+
+    data = SimpleNamespace(
+        event=SimpleNamespace(
+            message=SimpleNamespace(
+                message_id="om_group_mention",
+                chat_id="oc_group",
+                chat_type="group",
+                message_type="text",
+                content=json.dumps({"text": "<at user_id=\"ou_bot\">bot</at> ping"}),
+            ),
+            sender=SimpleNamespace(
+                sender_type="user",
+                sender_id=SimpleNamespace(open_id="ou_user"),
+            ),
+        )
+    )
+
+    await channel._on_message(data)
+
+    create_card.assert_awaited_once()
+    channel._handle_message.assert_awaited_once()
+    metadata = channel._handle_message.await_args.kwargs["metadata"]
+    assert metadata["is_group"] is True
+    assert metadata["group_sender_id"] == "ou_user"
+    assert metadata["was_mentioned"] is True
+    assert metadata["proactive_reply"] is False
+
+
+@pytest.mark.asyncio
+async def test_on_message_group_mention_policy_can_reply_proactively(monkeypatch) -> None:
+    channel = _make_channel()
+    channel.config.group_policy = "mention"
+    channel.config.bot_open_id = "ou_bot"
+    channel.config.proactive_reply_probability = 0.5
+    channel._add_reaction = AsyncMock(return_value="reaction_proactive")
+    channel._handle_message = AsyncMock()
+    create_card = AsyncMock()
+    monkeypatch.setattr(channel, "_create_processing_card_for_message", create_card)
+    monkeypatch.setattr("nanobot.channels.feishu.random.random", lambda: 0.01)
+
+    data = SimpleNamespace(
+        event=SimpleNamespace(
+            message=SimpleNamespace(
+                message_id="om_group_proactive",
+                chat_id="oc_group",
+                chat_type="group",
+                message_type="text",
+                content=json.dumps({"text": "normal group message"}),
+            ),
+            sender=SimpleNamespace(
+                sender_type="user",
+                sender_id=SimpleNamespace(open_id="ou_user"),
+            ),
+        )
+    )
+
+    await channel._on_message(data)
+
+    create_card.assert_awaited_once()
+    channel._handle_message.assert_awaited_once()
+    metadata = channel._handle_message.await_args.kwargs["metadata"]
+    assert metadata["was_mentioned"] is False
+    assert metadata["proactive_reply"] is True
 
 
 @pytest.mark.asyncio

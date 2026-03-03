@@ -43,6 +43,12 @@ class FeishuConfig(Base):
     verification_token: str = ""  # Verification Token for event subscription (optional)
     allow_from: list[str] = Field(default_factory=list)  # Allowed user open_ids
     react_emoji: str = "THUMBSUP"  # Emoji type for message reactions (e.g. THUMBSUP, OK, DONE, SMILE)
+    group_policy: Literal["open", "mention", "allowlist"] = "mention"
+    group_allow_from: list[str] = Field(default_factory=list)
+    allow_room_mentions: bool = False
+    proactive_reply_probability: float = 0.0
+    bot_open_id: str = ""
+    admin_ids: list[str] = Field(default_factory=list)
 
 
 class DingTalkConfig(Base):

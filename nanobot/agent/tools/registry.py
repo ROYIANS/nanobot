@@ -31,13 +31,23 @@ class ToolRegistry:
         """Check if a tool is registered."""
         return name in self._tools
 
-    def get_definitions(self) -> list[dict[str, Any]]:
+    def get_definitions(self, allowed_names: set[str] | None = None) -> list[dict[str, Any]]:
         """Get all tool definitions in OpenAI format."""
-        return [tool.to_schema() for tool in self._tools.values()]
+        if allowed_names is None:
+            return [tool.to_schema() for tool in self._tools.values()]
+        return [tool.to_schema() for name, tool in self._tools.items() if name in allowed_names]
 
-    async def execute(self, name: str, params: dict[str, Any]) -> str:
+    async def execute(
+        self,
+        name: str,
+        params: dict[str, Any],
+        allowed_names: set[str] | None = None,
+    ) -> str:
         """Execute a tool by name with given parameters."""
         _HINT = "\n\n[Analyze the error above and try a different approach.]"
+
+        if allowed_names is not None and name not in allowed_names:
+            return f"Error: Tool '{name}' is not allowed in the current context." + _HINT
 
         tool = self._tools.get(name)
         if not tool:

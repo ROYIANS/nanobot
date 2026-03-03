@@ -89,6 +89,21 @@ async def test_registry_returns_validation_error() -> None:
     assert "Invalid parameters" in result
 
 
+def test_registry_get_definitions_can_filter_allowed_names() -> None:
+    reg = ToolRegistry()
+    reg.register(SampleTool())
+    defs = reg.get_definitions(allowed_names={"sample"})
+    assert len(defs) == 1
+    assert defs[0]["function"]["name"] == "sample"
+
+
+async def test_registry_execute_blocks_tool_outside_allowlist() -> None:
+    reg = ToolRegistry()
+    reg.register(SampleTool())
+    result = await reg.execute("sample", {"query": "hello", "count": 1}, allowed_names=set())
+    assert "not allowed in the current context" in result
+
+
 def test_exec_extract_absolute_paths_keeps_full_windows_path() -> None:
     cmd = r"type C:\user\workspace\txt"
     paths = ExecTool._extract_absolute_paths(cmd)

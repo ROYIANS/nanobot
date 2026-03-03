@@ -49,6 +49,7 @@ class AgentLoop:
     _TOOL_RESULT_MAX_CHARS = 500
     _TASK_META_KEY = "active_task"
     _MAX_ITER_MSG_PREFIX = "I reached the maximum number of tool call iterations"
+    _ADMIN_ONLY_TOOLS = {"write_file", "edit_file", "exec", "spawn"}
     _IN_PROGRESS_PATTERNS = (
         re.compile(
             r"\b(i(?:'|’)ll|i will|next[, ]+i(?:'|’)ll|i'm going to|let me (?:check|look|inspect|review|fix|do|work on|continue|investigate))\b",
@@ -268,6 +269,7 @@ class AgentLoop:
         self,
         initial_messages: list[dict],
         on_progress: Callable[..., Awaitable[None]] | None = None,
+        allowed_tool_names: set[str] | None = None,
     ) -> tuple[str | None, list[str], list[dict]]:
         """Run the agent iteration loop. Returns (final_content, tools_used, messages)."""
         messages = initial_messages
@@ -280,7 +282,7 @@ class AgentLoop:
 
             response = await self.provider.chat(
                 messages=messages,
-                tools=self.tools.get_definitions(),
+                tools=self.tools.get_definitions(allowed_names=allowed_tool_names),
                 model=self.model,
                 temperature=self.temperature,
                 max_tokens=self.max_tokens,
@@ -315,7 +317,11 @@ class AgentLoop:
                     tools_used.append(tool_call.name)
                     args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
                     logger.info("Tool call: {}({})", tool_call.name, args_str[:200])
-                    result = await self.tools.execute(tool_call.name, tool_call.arguments)
+                    result = await self.tools.execute(
+                        tool_call.name,
+                        tool_call.arguments,
+                        allowed_names=allowed_tool_names,
+                    )
                     messages = self.context.add_tool_result(
                         messages, tool_call.id, tool_call.name, result
                     )
@@ -342,6 +348,28 @@ class AgentLoop:
             )
 
         return final_content, tools_used, messages
+
+    def _allowed_tool_names_for_message(self, msg: InboundMessage) -> set[str] | None:
+        """Return tool allowlist for this message, or None for full access."""
+        if msg.channel != "feishu":
+            return None
+        if not self.channels_config:
+            return None
+
+        feishu_cfg = getattr(self.channels_config, "feishu", None)
+        if not feishu_cfg:
+            return None
+
+        admin_ids = {str(x).strip() for x in (feishu_cfg.admin_ids or []) if str(x).strip()}
+        if not admin_ids:
+            return None
+
+        sender = str((msg.metadata or {}).get("group_sender_id") or msg.sender_id or "").strip()
+        if sender in admin_ids:
+            return None
+
+        all_tools = set(self.tools.tool_names)
+        return all_tools - self._ADMIN_ONLY_TOOLS
 
     async def run(self) -> None:
         """Run the agent loop, dispatching messages as tasks to stay responsive to /stop."""
@@ -576,6 +604,15 @@ class AgentLoop:
             )
             self.sessions.save(session)
 
+        # Preserve group speaker identity in shared room sessions.
+        if (
+            not cmd.startswith("/")
+            and bool((msg.metadata or {}).get("is_group"))
+            and str((msg.metadata or {}).get("group_sender_id") or "").strip()
+        ):
+            speaker = str((msg.metadata or {}).get("group_sender_id")).strip()
+            effective_message = f"[Group speaker: {speaker}]\n{msg.content}"
+
         self._set_tool_context(msg.channel, msg.chat_id, msg.metadata.get("message_id"))
         if message_tool := self.tools.get("message"):
             if isinstance(message_tool, MessageTool):
@@ -597,8 +634,11 @@ class AgentLoop:
                 channel=msg.channel, chat_id=msg.chat_id, content=content, metadata=meta,
             ))
 
+        allowed_tool_names = self._allowed_tool_names_for_message(msg)
         final_content, _, all_msgs = await self._run_agent_loop(
-            initial_messages, on_progress=on_progress or _bus_progress,
+            initial_messages,
+            on_progress=on_progress or _bus_progress,
+            allowed_tool_names=allowed_tool_names,
         )
 
         if final_content is None:

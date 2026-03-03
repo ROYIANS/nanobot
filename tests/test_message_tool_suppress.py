@@ -1,4 +1,4 @@
-"""Test message tool suppress logic for final replies."""
+"""Test message tool final-reply behavior."""
 
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
@@ -19,11 +19,11 @@ def _make_loop(tmp_path: Path) -> AgentLoop:
     return AgentLoop(bus=bus, provider=provider, workspace=tmp_path, model="test-model", memory_window=10)
 
 
-class TestMessageToolSuppressLogic:
-    """Final reply suppressed only when message tool sends to the same target."""
+class TestMessageToolFinalReplyLogic:
+    """Final reply should still be emitted even when message tool sends to same target."""
 
     @pytest.mark.asyncio
-    async def test_suppress_when_sent_to_same_target(self, tmp_path: Path) -> None:
+    async def test_keep_final_reply_when_sent_to_same_target(self, tmp_path: Path) -> None:
         loop = _make_loop(tmp_path)
         tool_call = ToolCallRequest(
             id="call1", name="message",
@@ -45,7 +45,8 @@ class TestMessageToolSuppressLogic:
         result = await loop._process_message(msg)
 
         assert len(sent) == 1
-        assert result is None  # suppressed
+        assert result is not None
+        assert result.content == "Done"
 
     @pytest.mark.asyncio
     async def test_not_suppress_when_sent_to_different_target(self, tmp_path: Path) -> None:
@@ -71,7 +72,7 @@ class TestMessageToolSuppressLogic:
 
         assert len(sent) == 1
         assert sent[0].channel == "email"
-        assert result is not None  # not suppressed
+        assert result is not None
         assert result.channel == "feishu"
 
     @pytest.mark.asyncio
@@ -174,3 +175,60 @@ class TestFeishuNewSessionSystemMessage:
         payload = response.metadata["feishu_system_content"]
         assert payload["type"] == "divider"
         assert payload["params"]["divider_text"]["i18n_text"]["en_US"] == "New Session"
+
+
+class TestTaskContinueCommand:
+    @pytest.mark.asyncio
+    async def test_continue_returns_hint_when_no_active_task(self, tmp_path: Path) -> None:
+        loop = _make_loop(tmp_path)
+
+        msg = InboundMessage(channel="feishu", sender_id="u1", chat_id="c1", content="/continue")
+        out = await loop._process_message(msg)
+
+        assert out is not None
+        assert "No active task to continue" in out.content
+
+    @pytest.mark.asyncio
+    async def test_continue_uses_previous_objective_when_task_in_progress(self, tmp_path: Path) -> None:
+        loop = _make_loop(tmp_path)
+        seen_user_messages: list[str] = []
+        calls = iter([
+            LLMResponse(content="我先看看 lark_oapi 里的定义。", tool_calls=[]),
+            LLMResponse(content="修复完成。", tool_calls=[]),
+        ])
+
+        async def _chat(*, messages, **kwargs):
+            seen_user_messages.append(messages[-1]["content"])
+            return next(calls)
+
+        loop.provider.chat = AsyncMock(side_effect=_chat)
+        loop.tools.get_definitions = MagicMock(return_value=[])
+
+        first = await loop._process_message(
+            InboundMessage(channel="feishu", sender_id="u1", chat_id="c1", content="请修复这个 bug")
+        )
+        assert first is not None
+
+        session = loop.sessions.get_or_create("feishu:c1")
+        task = session.metadata.get("active_task", {})
+        assert task.get("status") == "in_progress"
+        assert task.get("objective") == "请修复这个 bug"
+
+        second = await loop._process_message(
+            InboundMessage(channel="feishu", sender_id="u1", chat_id="c1", content="/continue")
+        )
+        assert second is not None
+        assert second.content == "修复完成。"
+        assert "Continue the active task" in seen_user_messages[-1]
+        assert "请修复这个 bug" in seen_user_messages[-1]
+
+    @pytest.mark.asyncio
+    async def test_help_includes_continue_command(self, tmp_path: Path) -> None:
+        loop = _make_loop(tmp_path)
+
+        out = await loop._process_message(
+            InboundMessage(channel="feishu", sender_id="u1", chat_id="c1", content="/help")
+        )
+
+        assert out is not None
+        assert "/continue — Continue the current task" in out.content

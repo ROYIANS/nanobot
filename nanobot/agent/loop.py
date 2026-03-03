@@ -7,6 +7,7 @@ import json
 import re
 import weakref
 from contextlib import AsyncExitStack
+from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
@@ -45,6 +46,15 @@ class AgentLoop:
     """
 
     _TOOL_RESULT_MAX_CHARS = 500
+    _TASK_META_KEY = "active_task"
+    _MAX_ITER_MSG_PREFIX = "I reached the maximum number of tool call iterations"
+    _IN_PROGRESS_PATTERNS = (
+        re.compile(
+            r"\b(i(?:'|’)ll|i will|next[, ]+i(?:'|’)ll|i'm going to|let me (?:check|look|inspect|review|fix|do|work on|continue|investigate))\b",
+            re.IGNORECASE,
+        ),
+        re.compile(r"(我先|我会先|接下来我会|下一步我会|稍后我会|让我先)"),
+    )
 
     def __init__(
         self,
@@ -177,6 +187,49 @@ class AgentLoop:
             return f'{tc.name}("{val[:40]}…")' if len(val) > 40 else f'{tc.name}("{val}")'
         return ", ".join(_fmt(tc) for tc in tool_calls)
 
+    @staticmethod
+    def _now_iso() -> str:
+        return datetime.now().isoformat()
+
+    def _get_active_task(self, session: Session) -> dict[str, Any] | None:
+        metadata = getattr(session, "metadata", None)
+        if not isinstance(metadata, dict):
+            return None
+        task = metadata.get(self._TASK_META_KEY)
+        return task if isinstance(task, dict) else None
+
+    def _set_active_task(self, session: Session, task: dict[str, Any]) -> None:
+        metadata = getattr(session, "metadata", None)
+        if not isinstance(metadata, dict):
+            return
+        metadata[self._TASK_META_KEY] = task
+        session.updated_at = datetime.now()
+
+    def _build_continue_prompt(self, task: dict[str, Any]) -> str:
+        objective = str(task.get("objective") or "").strip() or "(unknown)"
+        last_message = str(task.get("last_assistant_message") or "").strip() or "(none)"
+        return (
+            "Continue the active task from where you left off.\n"
+            f"Original task: {objective}\n"
+            f"Last assistant update: {last_message}\n"
+            "Do not restart from scratch. Reuse prior progress and finish the task now."
+        )
+
+    def _infer_task_status(self, final_content: str) -> tuple[str, str]:
+        content = (final_content or "").strip()
+        lowered = content.lower()
+
+        if not content:
+            return "in_progress", "empty_response"
+        if self._MAX_ITER_MSG_PREFIX in content:
+            return "in_progress", "max_iterations"
+        if "encountered an error" in lowered or lowered.startswith("error calling llm"):
+            return "blocked", "error_response"
+        for pattern in self._IN_PROGRESS_PATTERNS:
+            if pattern.search(content):
+                return "in_progress", "future_intent"
+        return "completed", "final_response"
+
     async def _run_agent_loop(
         self,
         initial_messages: list[dict],
@@ -287,6 +340,17 @@ class AgentLoop:
         sub_cancelled = await self.subagents.cancel_by_session(msg.session_key)
         total = cancelled + sub_cancelled
         content = f"⏹ Stopped {total} task(s)." if total else "No active task to stop."
+        try:
+            session = self.sessions.get_or_create(msg.session_key)
+            task = self._get_active_task(session)
+            if task:
+                task["status"] = "cancelled"
+                task["status_reason"] = "stopped_by_user"
+                task["updated_at"] = self._now_iso()
+                self._set_active_task(session, task)
+                self.sessions.save(session)
+        except Exception:
+            logger.debug("Skip active task update during /stop for {}", msg.session_key)
         metadata = dict(msg.metadata or {})
         if msg.channel == "feishu" and metadata.get("message_id"):
             metadata["_turn_done"] = True
@@ -404,6 +468,7 @@ class AgentLoop:
                 self._consolidating.discard(session.key)
 
             session.clear()
+            session.metadata = {}
             self.sessions.save(session)
             self.sessions.invalidate(session.key)
             if msg.channel == "feishu":
@@ -429,9 +494,17 @@ class AgentLoop:
                 )
             return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
                                   content="New session started.")
+        if cmd == "/continue":
+            task = self._get_active_task(session)
+            if not task or task.get("status") in {"completed", "cancelled"}:
+                return OutboundMessage(
+                    channel=msg.channel,
+                    chat_id=msg.chat_id,
+                    content="No active task to continue. Send a new request first.",
+                )
         if cmd == "/help":
             return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
-                                  content="🐈 nanobot commands:\n/new — Start a new conversation\n/stop — Stop the current task\n/help — Show available commands")
+                                  content="🐈 nanobot commands:\n/new — Start a new conversation\n/continue — Continue the current task\n/stop — Stop the current task\n/help — Show available commands")
 
         unconsolidated = len(session.messages) - session.last_consolidated
         if (unconsolidated >= self.memory_window and session.key not in self._consolidating):
@@ -451,6 +524,34 @@ class AgentLoop:
             _task = asyncio.create_task(_consolidate_and_unlock())
             self._consolidation_tasks.add(_task)
 
+        effective_message = msg.content
+        objective = msg.content
+        if cmd == "/continue":
+            task = self._get_active_task(session) or {}
+            objective = str(task.get("objective") or "").strip() or msg.content
+            effective_message = self._build_continue_prompt(task)
+            task["status"] = "running"
+            task["status_reason"] = "resumed"
+            task["objective"] = objective
+            task["updated_at"] = self._now_iso()
+            task["resume_count"] = int(task.get("resume_count") or 0) + 1
+            self._set_active_task(session, task)
+            self.sessions.save(session)
+        elif not cmd.startswith("/"):
+            self._set_active_task(
+                session,
+                {
+                    "status": "running",
+                    "status_reason": "new_request",
+                    "objective": objective,
+                    "created_at": self._now_iso(),
+                    "updated_at": self._now_iso(),
+                    "resume_count": 0,
+                    "turn_count": 0,
+                },
+            )
+            self.sessions.save(session)
+
         self._set_tool_context(msg.channel, msg.chat_id, msg.metadata.get("message_id"))
         if message_tool := self.tools.get("message"):
             if isinstance(message_tool, MessageTool):
@@ -459,7 +560,7 @@ class AgentLoop:
         history = session.get_history(max_messages=self.memory_window)
         initial_messages = self.context.build_messages(
             history=history,
-            current_message=msg.content,
+            current_message=effective_message,
             media=msg.media if msg.media else None,
             channel=msg.channel, chat_id=msg.chat_id,
         )
@@ -480,10 +581,17 @@ class AgentLoop:
             final_content = "I've completed processing but have no response to give."
 
         self._save_turn(session, all_msgs, 1 + len(history))
+        task = self._get_active_task(session)
+        if task:
+            status, reason = self._infer_task_status(final_content)
+            task["status"] = status
+            task["status_reason"] = reason
+            task["objective"] = objective
+            task["last_assistant_message"] = final_content
+            task["updated_at"] = self._now_iso()
+            task["turn_count"] = int(task.get("turn_count") or 0) + 1
+            self._set_active_task(session, task)
         self.sessions.save(session)
-
-        if (mt := self.tools.get("message")) and isinstance(mt, MessageTool) and mt._sent_in_turn:
-            return None
 
         preview = final_content[:120] + "..." if len(final_content) > 120 else final_content
         logger.info("Response to {}:{}: {}", msg.channel, msg.sender_id, preview)

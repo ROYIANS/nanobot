@@ -64,3 +64,14 @@ def test_runtime_context_is_separate_untrusted_user_message(tmp_path) -> None:
 
     assert messages[-1]["role"] == "user"
     assert messages[-1]["content"] == "Return exactly: OK"
+
+
+def test_system_prompt_requires_autonomous_execution(tmp_path) -> None:
+    """System prompt should discourage ending turns with future-intent placeholders."""
+    workspace = _make_workspace(tmp_path)
+    builder = ContextBuilder(workspace)
+
+    prompt = builder.build_system_prompt()
+
+    assert "Do not end a turn with \"I'll check/do X next\"" in prompt
+    assert "Continue autonomously until the task is done" in prompt

@@ -302,6 +302,35 @@ async def test_send_system_divider_message_from_metadata(monkeypatch) -> None:
     assert json.loads(sent_calls[0][3]) == payload
 
 
+@pytest.mark.asyncio
+async def test_send_post_message_from_force_msg_type_and_payload(monkeypatch) -> None:
+    channel = _make_channel()
+    sent_calls: list[tuple[str, str, str, str]] = []
+
+    def _fake_send(receive_id_type: str, receive_id: str, msg_type: str, content: str) -> str | None:
+        sent_calls.append((receive_id_type, receive_id, msg_type, content))
+        return "om_post"
+
+    monkeypatch.setattr(channel, "_send_message_sync", _fake_send)
+
+    payload = {"zh_cn": {"title": "日报", "content": [[{"tag": "text", "text": "完成"}]]}}
+    await channel.send(
+        OutboundMessage(
+            channel="feishu",
+            chat_id="ou_123",
+            content="fallback text",
+            metadata={
+                "feishu_msg_type": "post",
+                "feishu_content": payload,
+            },
+        )
+    )
+
+    assert len(sent_calls) == 1
+    assert sent_calls[0][2] == "post"
+    assert json.loads(sent_calls[0][3]) == payload
+
+
 def test_update_message_sync_supports_patch_body_without_msg_type(monkeypatch) -> None:
     channel = _make_channel()
 
@@ -364,3 +393,20 @@ def test_update_message_sync_supports_patch_body_without_msg_type(monkeypatch) -
     assert ok is True
     assert recorded["request"]["message_id"] == "om_patch"
     assert recorded["request"]["body"] == {"content": "{\"x\":1}"}
+
+
+def test_upload_file_sync_rejects_empty_file(tmp_path) -> None:
+    channel = _make_channel()
+    p = tmp_path / "empty.pdf"
+    p.write_bytes(b"")
+
+    assert channel._upload_file_sync(str(p)) is None
+
+
+def test_upload_file_sync_rejects_file_larger_than_30mb(tmp_path, monkeypatch) -> None:
+    channel = _make_channel()
+    p = tmp_path / "big.pdf"
+    p.write_bytes(b"1")
+    monkeypatch.setattr("os.path.getsize", lambda _path: (30 * 1024 * 1024) + 1)
+
+    assert channel._upload_file_sync(str(p)) is None

@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import re
+import subprocess
 import threading
 from collections import OrderedDict
 from pathlib import Path
@@ -260,6 +261,8 @@ class FeishuChannel(BaseChannel):
     """
 
     name = "feishu"
+    _MAX_UPLOAD_FILE_BYTES = 30 * 1024 * 1024
+    _NON_OPUS_AUDIO_EXTS = {".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg", ".amr"}
 
     def __init__(self, config: FeishuConfig, bus: MessageBus):
         super().__init__(config, bus)
@@ -636,21 +639,69 @@ class FeishuChannel(BaseChannel):
             logger.error("Error uploading image {}: {}", file_path, e)
             return None
 
-    def _upload_file_sync(self, file_path: str) -> str | None:
+    @staticmethod
+    def _probe_duration_ms(file_path: str) -> int | None:
+        """Try to detect media duration with ffprobe; return None when unavailable."""
+        try:
+            result = subprocess.run(
+                [
+                    "ffprobe",
+                    "-v",
+                    "error",
+                    "-show_entries",
+                    "format=duration",
+                    "-of",
+                    "default=noprint_wrappers=1:nokey=1",
+                    file_path,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+        except Exception:
+            return None
+
+        if result.returncode != 0:
+            return None
+        try:
+            seconds = float((result.stdout or "").strip())
+        except Exception:
+            return None
+        ms = int(seconds * 1000)
+        return ms if ms > 0 else None
+
+    def _upload_file_sync(self, file_path: str, duration_ms: int | None = None) -> str | None:
         """Upload a file to Feishu and return the file_key."""
         ext = os.path.splitext(file_path)[1].lower()
         file_type = self._FILE_TYPE_MAP.get(ext, "stream")
         file_name = os.path.basename(file_path)
         try:
+            file_size = os.path.getsize(file_path)
+        except Exception as e:
+            logger.error("Error reading file size {}: {}", file_path, e)
+            return None
+        if file_size <= 0:
+            logger.error("Cannot upload empty file: {}", file_path)
+            return None
+        if file_size > self._MAX_UPLOAD_FILE_BYTES:
+            logger.error(
+                "File too large for Feishu upload (max 30MB): {} ({} bytes)",
+                file_path,
+                file_size,
+            )
+            return None
+        try:
             with open(file_path, "rb") as f:
-                request = CreateFileRequest.builder() \
-                    .request_body(
-                        CreateFileRequestBody.builder()
-                        .file_type(file_type)
-                        .file_name(file_name)
-                        .file(f)
-                        .build()
-                    ).build()
+                builder = (
+                    CreateFileRequestBody.builder()
+                    .file_type(file_type)
+                    .file_name(file_name)
+                    .file(f)
+                )
+                if duration_ms and duration_ms > 0 and file_type in {"opus", "mp4"}:
+                    builder = builder.duration(duration_ms)
+                request = CreateFileRequest.builder().request_body(builder.build()).build()
                 response = self._client.im.v1.file.create(request)
                 if response.success():
                     file_key = response.data.file_key
@@ -794,6 +845,7 @@ class FeishuChannel(BaseChannel):
             is_progress = bool(msg.metadata.get("_progress"))
             is_tool_hint = bool(msg.metadata.get("_tool_hint"))
             force_msg_type = str(msg.metadata.get("feishu_msg_type", "")).strip().lower()
+            force_content = msg.metadata.get("feishu_content")
             force_system_content = msg.metadata.get("feishu_system_content")
 
             if is_progress:
@@ -815,7 +867,13 @@ class FeishuChannel(BaseChannel):
                             receive_id_type, msg.chat_id, "image", json.dumps({"image_key": key}, ensure_ascii=False),
                         )
                 else:
-                    key = await loop.run_in_executor(None, self._upload_file_sync, file_path)
+                    duration_ms = self._probe_duration_ms(file_path) if ext in {".opus", ".mp4"} else None
+                    if ext in self._NON_OPUS_AUDIO_EXTS:
+                        logger.warning(
+                            "Non-OPUS audio '{}' will be sent as file. Convert to .opus to send as audio.",
+                            os.path.basename(file_path),
+                        )
+                    key = await loop.run_in_executor(None, self._upload_file_sync, file_path, duration_ms)
                     if key:
                         media_type = "audio" if ext in self._AUDIO_EXTS else "file"
                         await loop.run_in_executor(
@@ -823,18 +881,43 @@ class FeishuChannel(BaseChannel):
                             receive_id_type, msg.chat_id, media_type, json.dumps({"file_key": key}, ensure_ascii=False),
                         )
 
-            if force_msg_type == "system" and force_system_content is not None:
-                payload = force_system_content
-                if not isinstance(payload, str):
-                    payload = json.dumps(payload, ensure_ascii=False)
-                await loop.run_in_executor(
-                    None,
-                    self._send_message_sync,
-                    receive_id_type,
-                    msg.chat_id,
-                    "system",
-                    payload,
-                )
+            if force_msg_type:
+                payload = force_content
+                if payload is None and force_msg_type == "system":
+                    payload = force_system_content
+                if payload is None and force_msg_type == "text":
+                    payload = {"text": msg.content}
+
+                if payload is None:
+                    if msg.content and msg.content.strip():
+                        logger.warning(
+                            "feishu_msg_type={} provided without feishu_content; fallback to plain text",
+                            force_msg_type,
+                        )
+                        await loop.run_in_executor(
+                            None,
+                            self._send_message_sync,
+                            receive_id_type,
+                            msg.chat_id,
+                            "text",
+                            json.dumps({"text": msg.content}, ensure_ascii=False),
+                        )
+                    else:
+                        logger.warning(
+                            "feishu_msg_type={} provided without feishu_content and no fallback text",
+                            force_msg_type,
+                        )
+                else:
+                    if not isinstance(payload, str):
+                        payload = json.dumps(payload, ensure_ascii=False)
+                    await loop.run_in_executor(
+                        None,
+                        self._send_message_sync,
+                        receive_id_type,
+                        msg.chat_id,
+                        force_msg_type,
+                        payload,
+                    )
             elif msg.content and msg.content.strip():
                 await loop.run_in_executor(
                     None, self._send_message_sync,

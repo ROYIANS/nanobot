@@ -626,7 +626,7 @@ class TestConsolidationDeduplicationGuard:
     async def test_new_waits_for_inflight_consolidation_and_preserves_messages(
         self, tmp_path: Path
     ) -> None:
-        """/new waits for in-flight consolidation and archives before clear."""
+        """/new waits for in-flight consolidation, then archives in background."""
         from nanobot.agent.loop import AgentLoop
         from nanobot.bus.events import InboundMessage
         from nanobot.bus.queue import MessageBus
@@ -677,14 +677,20 @@ class TestConsolidationDeduplicationGuard:
         response = await pending_new
         assert response is not None
         assert "new session started" in response.content.lower()
+        for _ in range(20):
+            if archived_count > 0:
+                break
+            await asyncio.sleep(0.01)
         assert archived_count > 0, "Expected /new archival to process a non-empty snapshot"
 
         session_after = loop.sessions.get_or_create("cli:test")
         assert session_after.messages == [], "Session should be cleared after successful archival"
 
     @pytest.mark.asyncio
-    async def test_new_does_not_clear_session_when_archive_fails(self, tmp_path: Path) -> None:
-        """/new must keep session data if archive step reports failure."""
+    async def test_new_returns_immediately_even_when_background_archive_is_slow(
+        self, tmp_path: Path
+    ) -> None:
+        """/new should not wait for archive_all background work to finish."""
         from nanobot.agent.loop import AgentLoop
         from nanobot.bus.events import InboundMessage
         from nanobot.bus.queue import MessageBus
@@ -705,24 +711,30 @@ class TestConsolidationDeduplicationGuard:
             session.add_message("user", f"msg{i}")
             session.add_message("assistant", f"resp{i}")
         loop.sessions.save(session)
-        before_count = len(session.messages)
+        started = asyncio.Event()
+        release = asyncio.Event()
 
-        async def _failing_consolidate(sess, archive_all: bool = False) -> bool:
+        async def _slow_archive_consolidate(sess, archive_all: bool = False) -> bool:
             if archive_all:
+                started.set()
+                await release.wait()
                 return False
             return True
 
-        loop._consolidate_memory = _failing_consolidate  # type: ignore[method-assign]
+        loop._consolidate_memory = _slow_archive_consolidate  # type: ignore[method-assign]
 
         new_msg = InboundMessage(channel="cli", sender_id="user", chat_id="test", content="/new")
-        response = await loop._process_message(new_msg)
+        pending_new = asyncio.create_task(loop._process_message(new_msg))
+        await asyncio.sleep(0.02)
 
+        assert pending_new.done(), "/new should not block on archive_all background task"
+        response = await pending_new
         assert response is not None
-        assert "failed" in response.content.lower()
+        assert "new session started" in response.content.lower()
         session_after = loop.sessions.get_or_create("cli:test")
-        assert len(session_after.messages) == before_count, (
-            "Session must remain intact when /new archival fails"
-        )
+        assert len(session_after.messages) == 0
+        await started.wait()
+        release.set()
 
     @pytest.mark.asyncio
     async def test_new_archives_only_unconsolidated_messages_after_inflight_task(
@@ -781,6 +793,10 @@ class TestConsolidationDeduplicationGuard:
 
         assert response is not None
         assert "new session started" in response.content.lower()
+        for _ in range(20):
+            if archived_count == 3:
+                break
+            await asyncio.sleep(0.01)
         assert archived_count == 3, (
             f"Expected only unconsolidated tail to archive, got {archived_count}"
         )

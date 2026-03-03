@@ -122,6 +122,7 @@ class AgentLoop:
         self._consolidating: set[str] = set()  # Session keys with consolidation in progress
         self._consolidation_tasks: set[asyncio.Task] = set()  # Strong refs to in-flight tasks
         self._consolidation_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
+        self._archive_tasks: set[asyncio.Task] = set()  # Strong refs to /new archival tasks
         self._active_tasks: dict[str, list[asyncio.Task]] = {}  # session_key -> tasks
         self._processing_lock = asyncio.Lock()
         self._register_default_tools()
@@ -215,6 +216,28 @@ class AgentLoop:
             return
         metadata[self._TASK_META_KEY] = task
         session.updated_at = datetime.now()
+
+    def _archive_snapshot_after_new(self, session_key: str, snapshot: list[dict[str, Any]]) -> None:
+        """Archive a copied snapshot in background so /new can return immediately."""
+        if not snapshot:
+            return
+
+        async def _run() -> None:
+            try:
+                temp = Session(key=session_key)
+                temp.messages = list(snapshot)
+                ok = await self._consolidate_memory(temp, archive_all=True)
+                if not ok:
+                    logger.warning("/new background archival failed for {}", session_key)
+            except Exception:
+                logger.exception("/new background archival crashed for {}", session_key)
+            finally:
+                task = asyncio.current_task()
+                if task is not None:
+                    self._archive_tasks.discard(task)
+
+        task = asyncio.create_task(_run())
+        self._archive_tasks.add(task)
 
     def _build_continue_prompt(self, task: dict[str, Any]) -> str:
         objective = str(task.get("objective") or "").strip() or "(unknown)"
@@ -458,23 +481,12 @@ class AgentLoop:
         if cmd == "/new":
             lock = self._consolidation_locks.setdefault(session.key, asyncio.Lock())
             self._consolidating.add(session.key)
+            snapshot: list[dict[str, Any]] = []
             try:
                 async with lock:
-                    snapshot = session.messages[session.last_consolidated:]
-                    if snapshot:
-                        temp = Session(key=session.key)
-                        temp.messages = list(snapshot)
-                        if not await self._consolidate_memory(temp, archive_all=True):
-                            return OutboundMessage(
-                                channel=msg.channel, chat_id=msg.chat_id,
-                                content="Memory archival failed, session not cleared. Please try again.",
-                            )
+                    snapshot = list(session.messages[session.last_consolidated:])
             except Exception:
                 logger.exception("/new archival failed for {}", session.key)
-                return OutboundMessage(
-                    channel=msg.channel, chat_id=msg.chat_id,
-                    content="Memory archival failed, session not cleared. Please try again.",
-                )
             finally:
                 self._consolidating.discard(session.key)
 
@@ -482,6 +494,7 @@ class AgentLoop:
             session.metadata = {}
             self.sessions.save(session)
             self.sessions.invalidate(session.key)
+            self._archive_snapshot_after_new(session.key, snapshot)
             if msg.channel == "feishu":
                 meta = dict(msg.metadata or {})
                 meta["feishu_msg_type"] = "system"

@@ -266,6 +266,43 @@ class TestTaskContinueCommand:
         assert out is not None
         assert "/continue" in out.content
 
+    @pytest.mark.asyncio
+    async def test_botid_returns_resolved_id_from_metadata(self, tmp_path: Path) -> None:
+        loop = _make_loop(tmp_path)
+
+        out = await loop._process_message(
+            InboundMessage(
+                channel="feishu",
+                sender_id="u1",
+                chat_id="c1",
+                content="/botid",
+                metadata={"bot_open_id": "ou_bot_meta"},
+            )
+        )
+
+        assert out is not None
+        assert out.content == "Bot open_id: ou_bot_meta"
+
+    @pytest.mark.asyncio
+    async def test_botid_returns_configured_id_when_metadata_missing(self, tmp_path: Path) -> None:
+        channels_cfg = ChannelsConfig(
+            feishu=FeishuConfig(
+                enabled=True,
+                app_id="cli_xxx",
+                app_secret="secret",
+                allow_from=["*"],
+                bot_open_id="ou_bot_cfg",
+            )
+        )
+        loop = _make_loop(tmp_path, channels_config=channels_cfg)
+
+        out = await loop._process_message(
+            InboundMessage(channel="feishu", sender_id="u1", chat_id="c1", content="/botid")
+        )
+
+        assert out is not None
+        assert out.content == "Bot open_id: ou_bot_cfg"
+
 class TestFeishuGroupAndAdminControls:
     @pytest.mark.asyncio
     async def test_group_message_includes_speaker_marker_in_prompt(self, tmp_path: Path) -> None:

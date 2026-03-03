@@ -280,6 +280,7 @@ class FeishuChannel(BaseChannel):
         self._processing_card_step: OrderedDict[str, int] = OrderedDict()  # source message_id -> dot animation step
         self._processing_card_animators: dict[str, asyncio.Task[None]] = {}
         self._loop: asyncio.AbstractEventLoop | None = None
+        self._bot_open_id: str = str(config.bot_open_id or "").strip()
 
     async def start(self) -> None:
         """Start the Feishu bot with WebSocket long connection."""
@@ -300,6 +301,7 @@ class FeishuChannel(BaseChannel):
             .app_secret(self.config.app_secret) \
             .log_level(lark.LogLevel.INFO) \
             .build()
+        await self._refresh_bot_open_id_via_api()
 
         # Create event handler (only register message receive, ignore other events)
         event_handler = lark.EventDispatcherHandler.builder(
@@ -348,6 +350,77 @@ class FeishuChannel(BaseChannel):
         """
         self._running = False
         logger.info("Feishu bot stopped")
+
+    def _fetch_bot_open_id_sync(self) -> str | None:
+        """Fetch bot open_id from Feishu OpenAPI (/open-apis/bot/v3/info)."""
+        if self._bot_open_id:
+            return self._bot_open_id
+        if not self.config.app_id or not self.config.app_secret:
+            return None
+        try:
+            import requests
+        except Exception:
+            return None
+
+        try:
+            token_resp = requests.post(
+                "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal",
+                json={"app_id": self.config.app_id, "app_secret": self.config.app_secret},
+                timeout=8,
+            )
+            token_data = token_resp.json() if token_resp is not None else {}
+            if token_data.get("code", 0) != 0:
+                logger.warning(
+                    "Failed to get tenant_access_token for bot id lookup: code={}, msg={}",
+                    token_data.get("code"),
+                    token_data.get("msg"),
+                )
+                return None
+            token = str(token_data.get("tenant_access_token", "")).strip()
+            if not token:
+                return None
+
+            info_resp = requests.get(
+                "https://open.feishu.cn/open-apis/bot/v3/info",
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=8,
+            )
+            info_data = info_resp.json() if info_resp is not None else {}
+            if info_data.get("code", 0) != 0:
+                logger.warning(
+                    "Failed to fetch bot info: code={}, msg={}",
+                    info_data.get("code"),
+                    info_data.get("msg"),
+                )
+                return None
+
+            bot_obj = info_data.get("bot")
+            if not isinstance(bot_obj, dict):
+                data_obj = info_data.get("data")
+                if isinstance(data_obj, dict):
+                    bot_obj = data_obj.get("bot") if isinstance(data_obj.get("bot"), dict) else data_obj
+            if not isinstance(bot_obj, dict):
+                return None
+
+            open_id = str(bot_obj.get("open_id", "")).strip()
+            if open_id:
+                logger.info("Resolved Feishu bot open_id via API: {}", open_id)
+                return open_id
+            return None
+        except Exception as e:
+            logger.debug("Bot open_id API lookup failed: {}", e)
+            return None
+
+    async def _refresh_bot_open_id_via_api(self, force: bool = False) -> str:
+        """Resolve bot open_id via OpenAPI and cache it."""
+        if self._bot_open_id and not force:
+            return self._bot_open_id
+        loop = asyncio.get_running_loop()
+        resolved = await loop.run_in_executor(None, self._fetch_bot_open_id_sync)
+        if resolved:
+            self._bot_open_id = resolved
+            self.config.bot_open_id = resolved
+        return self._bot_open_id
 
     def _add_reaction_sync(self, message_id: str, emoji_type: str) -> str | None:
         """Sync helper for adding reaction (runs in thread pool)."""
@@ -1063,6 +1136,7 @@ class FeishuChannel(BaseChannel):
         self,
         *,
         chat_id: str,
+        sender_id: str,
         message: Any,
         msg_type: str,
         content_json: dict,
@@ -1076,7 +1150,13 @@ class FeishuChannel(BaseChannel):
             return True, False, False
 
         mentioned_ids = self._extract_mentioned_user_ids(message, msg_type, content_json)
-        bot_open_id = str(self.config.bot_open_id or "").strip()
+        bot_open_id = str(self._bot_open_id or self.config.bot_open_id or "").strip()
+        if not bot_open_id:
+            candidates = {uid for uid in mentioned_ids if uid not in {"all", sender_id}}
+            if len(candidates) == 1:
+                bot_open_id = next(iter(candidates))
+                self._bot_open_id = bot_open_id
+                self.config.bot_open_id = bot_open_id
         if bot_open_id:
             was_mentioned = bot_open_id in mentioned_ids
         else:
@@ -1150,6 +1230,7 @@ class FeishuChannel(BaseChannel):
                 else:
                     should_reply, was_mentioned, proactive_reply = self._should_respond_in_group(
                         chat_id=chat_id,
+                        sender_id=sender_id,
                         message=message,
                         msg_type=msg_type,
                         content_json=content_json,
@@ -1223,6 +1304,7 @@ class FeishuChannel(BaseChannel):
                     "group_sender_id": sender_id if is_group else "",
                     "was_mentioned": was_mentioned,
                     "proactive_reply": proactive_reply,
+                    "bot_open_id": self._bot_open_id or "",
                 }
             )
 

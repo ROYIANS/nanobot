@@ -557,6 +557,29 @@ class AgentLoop:
         if cmd == "/help":
             return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
                                   content="🐈 nanobot commands:\n/new — Start a new conversation\n/continue — Continue the current task\n/stop — Stop the current task\n/help — Show available commands")
+        if cmd == "/botid":
+            bot_id = str(
+                (msg.metadata or {}).get("bot_open_id")
+                or (
+                    getattr(getattr(self.channels_config, "feishu", None), "bot_open_id", "")
+                    if self.channels_config else ""
+                )
+                or ""
+            ).strip()
+            if bot_id:
+                return OutboundMessage(
+                    channel=msg.channel,
+                    chat_id=msg.chat_id,
+                    content=f"Bot open_id: {bot_id}",
+                )
+            return OutboundMessage(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                content=(
+                    "Bot open_id is not resolved yet. "
+                    "Please @bot once in group, or set channels.feishu.botOpenId in config."
+                ),
+            )
 
         unconsolidated = len(session.messages) - session.last_consolidated
         if (unconsolidated >= self.memory_window and session.key not in self._consolidating):

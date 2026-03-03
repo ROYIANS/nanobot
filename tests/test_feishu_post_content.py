@@ -256,6 +256,39 @@ async def test_on_message_group_mention_policy_can_reply_proactively(monkeypatch
 
 
 @pytest.mark.asyncio
+async def test_on_message_group_mention_infers_bot_open_id_from_single_mention(monkeypatch) -> None:
+    channel = _make_channel()
+    channel.config.group_policy = "mention"
+    channel.config.bot_open_id = ""
+    channel._add_reaction = AsyncMock(return_value="reaction_mention")
+    channel._handle_message = AsyncMock()
+    create_card = AsyncMock()
+    monkeypatch.setattr(channel, "_create_processing_card_for_message", create_card)
+
+    data = SimpleNamespace(
+        event=SimpleNamespace(
+            message=SimpleNamespace(
+                message_id="om_group_infer",
+                chat_id="oc_group",
+                chat_type="group",
+                message_type="text",
+                content=json.dumps({"text": "<at user_id=\"ou_bot\">bot</at> ping"}),
+            ),
+            sender=SimpleNamespace(
+                sender_type="user",
+                sender_id=SimpleNamespace(open_id="ou_user"),
+            ),
+        )
+    )
+
+    await channel._on_message(data)
+
+    assert channel.config.bot_open_id == "ou_bot"
+    metadata = channel._handle_message.await_args.kwargs["metadata"]
+    assert metadata["bot_open_id"] == "ou_bot"
+
+
+@pytest.mark.asyncio
 async def test_send_deletes_reaction_after_final_reply(monkeypatch) -> None:
     channel = _make_channel()
     channel._reaction_ids["om_2"] = "reaction_2"

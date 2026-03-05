@@ -984,10 +984,15 @@ class FeishuChannel(BaseChannel):
 
         try:
             receive_id_type = "chat_id" if msg.chat_id.startswith("oc_") else "open_id"
+            receive_id = msg.chat_id
             loop = asyncio.get_running_loop()
             source_message_id = str(msg.metadata.get("message_id", "")).strip()
             is_turn_done = bool(msg.metadata.get("_turn_done"))
             is_progress = bool(msg.metadata.get("_progress"))
+            # When reply_to_message is enabled, send as native Feishu thread reply quoting the user's message
+            if self.config.reply_to_message and source_message_id and not is_progress:
+                receive_id_type = "message_id"
+                receive_id = source_message_id
             is_tool_hint = bool(msg.metadata.get("_tool_hint"))
             force_msg_type = str(msg.metadata.get("feishu_msg_type", "")).strip().lower()
             force_content = msg.metadata.get("feishu_content")
@@ -1009,7 +1014,7 @@ class FeishuChannel(BaseChannel):
                     if key:
                         await loop.run_in_executor(
                             None, self._send_message_sync,
-                            receive_id_type, msg.chat_id, "image", json.dumps({"image_key": key}, ensure_ascii=False),
+                            receive_id_type, receive_id, "image", json.dumps({"image_key": key}, ensure_ascii=False),
                         )
                 else:
                     duration_ms = self._probe_duration_ms(file_path) if ext in {".opus", ".mp4"} else None
@@ -1023,7 +1028,7 @@ class FeishuChannel(BaseChannel):
                         media_type = "audio" if ext in self._AUDIO_EXTS else "file"
                         await loop.run_in_executor(
                             None, self._send_message_sync,
-                            receive_id_type, msg.chat_id, media_type, json.dumps({"file_key": key}, ensure_ascii=False),
+                            receive_id_type, receive_id, media_type, json.dumps({"file_key": key}, ensure_ascii=False),
                         )
 
             if force_msg_type:
@@ -1043,7 +1048,7 @@ class FeishuChannel(BaseChannel):
                             None,
                             self._send_message_sync,
                             receive_id_type,
-                            msg.chat_id,
+                            receive_id,
                             "text",
                             json.dumps({"text": msg.content}, ensure_ascii=False),
                         )
@@ -1059,14 +1064,14 @@ class FeishuChannel(BaseChannel):
                         None,
                         self._send_message_sync,
                         receive_id_type,
-                        msg.chat_id,
+                        receive_id,
                         force_msg_type,
                         payload,
                     )
             elif msg.content and msg.content.strip():
                 await loop.run_in_executor(
                     None, self._send_message_sync,
-                    receive_id_type, msg.chat_id, "text", json.dumps({"text": msg.content}, ensure_ascii=False),
+                    receive_id_type, receive_id, "text", json.dumps({"text": msg.content}, ensure_ascii=False),
                 )
 
             # Only clear reaction when agent explicitly marks this turn as complete.
@@ -1216,26 +1221,40 @@ class FeishuChannel(BaseChannel):
         try:
             from lark_oapi.api.im.v1 import ListMessageRequest
         except ImportError:
-            logger.debug("ListMessageRequest not available; group context disabled")
+            logger.warning("lark_oapi ListMessageRequest not available; group context disabled")
             return []
 
         try:
-            request = (
+            # Build request — use only the universally supported builder methods.
+            # sort_type / page_size are optional; skip them if the builder rejects them.
+            builder = (
                 ListMessageRequest.builder()
                 .container_id_type("chat")
                 .container_id(chat_id)
-                .sort_type("ByCreateTimeDesc")
-                .page_size(min(count + 5, 50))
-                .build()
             )
+            try:
+                builder = builder.sort_type("ByCreateTimeDesc")
+            except AttributeError:
+                pass  # older SDK version without sort_type
+            try:
+                builder = builder.page_size(min(count + 5, 50))
+            except AttributeError:
+                pass
+            request = builder.build()
+
+            logger.info("Feishu: fetching group context for chat={} count={}", chat_id, count)
             response = self._client.im.v1.message.list(request)
             if not response.success():
-                logger.warning(
-                    "Failed to fetch group context: code={}, msg={}", response.code, response.msg
+                logger.error(
+                    "Feishu: failed to fetch group context: code={} msg={} detail={}",
+                    response.code,
+                    response.msg,
+                    getattr(response, "error", ""),
                 )
                 return []
 
             items = list(getattr(response.data, "items", None) or [])
+            logger.info("Feishu: group context API returned {} items", len(items))
             result: list[tuple[str, str]] = []
             for item in items:
                 if getattr(item, "message_id", None) == current_msg_id:
@@ -1262,9 +1281,10 @@ class FeishuChannel(BaseChannel):
                     break
 
             result.reverse()  # oldest first → chronological order
+            logger.info("Feishu: group context assembled {} usable messages", len(result))
             return result
-        except Exception as e:
-            logger.warning("Error fetching group context: {}", e)
+        except Exception:
+            logger.exception("Feishu: exception in _fetch_group_context_sync for chat={}", chat_id)
             return []
 
     async def _fetch_group_context(

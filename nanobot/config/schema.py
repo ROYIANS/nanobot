@@ -50,6 +50,7 @@ class FeishuConfig(Base):
     bot_open_id: str = ""
     admin_ids: list[str] = Field(default_factory=list)
     group_context_count: int = 0  # Number of recent group messages to include as context (0 = disabled)
+    reply_to_message: bool = True  # If true, bot replies quote the user's original message
 
 
 class DingTalkConfig(Base):

@@ -1177,6 +1177,87 @@ class FeishuChannel(BaseChannel):
         proactive_hit = p > 0.0 and random.random() < p
         return proactive_hit, False, proactive_hit
 
+    def _extract_message_text(self, msg_type: str, content_json: dict) -> str:
+        """Extract plain text from a message content dict (used for group context)."""
+        if msg_type == "text":
+            return str(content_json.get("text", "")).strip()
+        elif msg_type == "post":
+            text, _ = _extract_post_content(content_json)
+            return text or ""
+        elif msg_type in ("image", "audio", "file", "media", "sticker"):
+            return MSG_TYPE_MAP.get(msg_type, f"[{msg_type}]")
+        elif msg_type in ("share_chat", "share_user", "interactive", "share_calendar_event", "system", "merge_forward"):
+            return _extract_share_card_content(content_json, msg_type)
+        return f"[{msg_type}]"
+
+    def _fetch_group_context_sync(
+        self, chat_id: str, count: int, current_msg_id: str
+    ) -> list[tuple[str, str]]:
+        """Fetch recent group messages for AI context. Returns [(short_sender_id, text), ...] in chronological order."""
+        try:
+            from lark_oapi.api.im.v1 import ListMessageRequest
+        except ImportError:
+            logger.debug("ListMessageRequest not available; group context disabled")
+            return []
+
+        try:
+            request = (
+                ListMessageRequest.builder()
+                .container_id_type("chat")
+                .container_id(chat_id)
+                .sort_type("ByCreateTimeDesc")
+                .page_size(min(count + 5, 50))
+                .build()
+            )
+            response = self._client.im.v1.message.list(request)
+            if not response.success():
+                logger.warning(
+                    "Failed to fetch group context: code={}, msg={}", response.code, response.msg
+                )
+                return []
+
+            items = list(getattr(response.data, "items", None) or [])
+            result: list[tuple[str, str]] = []
+            for item in items:
+                if getattr(item, "message_id", None) == current_msg_id:
+                    continue  # exclude current triggering message
+                sender = getattr(item, "sender", None)
+                sender_type = str(getattr(sender, "sender_type", "user") or "")
+                if sender_type == "bot":
+                    continue  # exclude bot replies
+
+                sender_id = str(getattr(sender, "id", "") or "").strip()
+                short_id = sender_id[-6:] if len(sender_id) > 6 else (sender_id or "?")
+
+                msg_type = str(getattr(item, "msg_type", "text") or "text")
+                body = getattr(item, "body", None)
+                body_content = str(getattr(body, "content", "") or "") if body else ""
+                try:
+                    content_json = json.loads(body_content) if body_content else {}
+                except json.JSONDecodeError:
+                    content_json = {}
+
+                text = self._extract_message_text(msg_type, content_json)
+                if text:
+                    result.append((short_id, text))
+                if len(result) >= count:
+                    break
+
+            result.reverse()  # oldest first → chronological order
+            return result
+        except Exception as e:
+            logger.warning("Error fetching group context: {}", e)
+            return []
+
+    async def _fetch_group_context(
+        self, chat_id: str, count: int, current_msg_id: str
+    ) -> list[tuple[str, str]]:
+        """Async wrapper around _fetch_group_context_sync."""
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            None, self._fetch_group_context_sync, chat_id, count, current_msg_id
+        )
+
     def _on_message_sync(self, data: "P2ImMessageReceiveV1") -> None:
         """
         Sync handler for incoming messages (called from WebSocket thread).
@@ -1289,6 +1370,17 @@ class FeishuChannel(BaseChannel):
 
             if not content and not media_paths:
                 return
+
+            # Prepend recent group chat history as context for the AI
+            if is_group and self.config.group_context_count > 0:
+                context_msgs = await self._fetch_group_context(
+                    chat_id, self.config.group_context_count, message_id
+                )
+                if context_msgs:
+                    history_lines = "\n".join(
+                        f"[用户_{sid}]: {text}" for sid, text in context_msgs
+                    )
+                    content = f"[群聊近期消息]\n{history_lines}\n\n[当前消息]\n{content}"
 
             # Forward to message bus
             await self._handle_message(

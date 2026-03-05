@@ -49,6 +49,7 @@ class FeishuConfig(Base):
     proactive_reply_probability: float = 0.0
     bot_open_id: str = ""
     admin_ids: list[str] = Field(default_factory=list)
+    group_context_count: int = 0  # Number of recent group messages to include as context (0 = disabled)
 
 
 class DingTalkConfig(Base):

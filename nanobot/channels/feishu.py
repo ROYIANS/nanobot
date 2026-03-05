@@ -281,6 +281,7 @@ class FeishuChannel(BaseChannel):
         self._processing_card_animators: dict[str, asyncio.Task[None]] = {}
         self._loop: asyncio.AbstractEventLoop | None = None
         self._bot_open_id: str = str(config.bot_open_id or "").strip()
+        self._user_name_cache: dict[str, str] = {}  # open_id → display name
 
     async def start(self) -> None:
         """Start the Feishu bot with WebSocket long connection."""
@@ -669,6 +670,12 @@ class FeishuChannel(BaseChannel):
             animator = self._processing_card_animators.pop(source_message_id, None)
             if animator:
                 animator.cancel()
+
+    # Max character length for a single message in AI context (history / parent quote)
+    _CONTEXT_MAX_TEXT_LEN = 300
+
+    # Strip Feishu @mention XML tags from raw text messages
+    _AT_TAG_RE = re.compile(r"<at[^>]*>.*?</at>", re.DOTALL)
 
     # Regex to match markdown tables (header + separator + data rows)
     _TABLE_RE = re.compile(
@@ -1177,23 +1184,35 @@ class FeishuChannel(BaseChannel):
         proactive_hit = p > 0.0 and random.random() < p
         return proactive_hit, False, proactive_hit
 
+    @classmethod
+    def _clean_at_tags(cls, text: str) -> str:
+        """Remove Feishu @mention XML tags from raw text, returning clean content."""
+        return cls._AT_TAG_RE.sub("", text).strip()
+
     def _extract_message_text(self, msg_type: str, content_json: dict) -> str:
-        """Extract plain text from a message content dict (used for group context)."""
+        """Extract plain text from a message content dict (used for context fetching).
+
+        Cleans @mention tags and truncates to _CONTEXT_MAX_TEXT_LEN.
+        """
         if msg_type == "text":
-            return str(content_json.get("text", "")).strip()
+            text = self._clean_at_tags(str(content_json.get("text", "")).strip())
         elif msg_type == "post":
-            text, _ = _extract_post_content(content_json)
-            return text or ""
+            raw, _ = _extract_post_content(content_json)
+            text = raw or ""
         elif msg_type in ("image", "audio", "file", "media", "sticker"):
-            return MSG_TYPE_MAP.get(msg_type, f"[{msg_type}]")
+            text = MSG_TYPE_MAP.get(msg_type, f"[{msg_type}]")
         elif msg_type in ("share_chat", "share_user", "interactive", "share_calendar_event", "system", "merge_forward"):
-            return _extract_share_card_content(content_json, msg_type)
-        return f"[{msg_type}]"
+            text = _extract_share_card_content(content_json, msg_type)
+        else:
+            text = f"[{msg_type}]"
+        if len(text) > self._CONTEXT_MAX_TEXT_LEN:
+            text = text[:self._CONTEXT_MAX_TEXT_LEN] + "..."
+        return text
 
     def _fetch_group_context_sync(
         self, chat_id: str, count: int, current_msg_id: str
     ) -> list[tuple[str, str]]:
-        """Fetch recent group messages for AI context. Returns [(short_sender_id, text), ...] in chronological order."""
+        """Fetch recent group messages for AI context. Returns [(open_id, text), ...] in chronological order."""
         try:
             from lark_oapi.api.im.v1 import ListMessageRequest
         except ImportError:
@@ -1227,7 +1246,6 @@ class FeishuChannel(BaseChannel):
                     continue  # exclude bot replies
 
                 sender_id = str(getattr(sender, "id", "") or "").strip()
-                short_id = sender_id[-6:] if len(sender_id) > 6 else (sender_id or "?")
 
                 msg_type = str(getattr(item, "msg_type", "text") or "text")
                 body = getattr(item, "body", None)
@@ -1239,7 +1257,7 @@ class FeishuChannel(BaseChannel):
 
                 text = self._extract_message_text(msg_type, content_json)
                 if text:
-                    result.append((short_id, text))
+                    result.append((sender_id, text))
                 if len(result) >= count:
                     break
 
@@ -1257,6 +1275,83 @@ class FeishuChannel(BaseChannel):
         return await loop.run_in_executor(
             None, self._fetch_group_context_sync, chat_id, count, current_msg_id
         )
+
+    def _fetch_parent_message_sync(self, parent_id: str) -> tuple[str, str] | None:
+        """Fetch the quoted/replied-to message. Returns (open_id, text) or None."""
+        try:
+            from lark_oapi.api.im.v1 import GetMessageRequest
+        except ImportError:
+            return None
+        try:
+            request = GetMessageRequest.builder().message_id(parent_id).build()
+            response = self._client.im.v1.message.get(request)
+            if not response.success():
+                logger.debug("Failed to fetch parent message {}: {}", parent_id, response.msg)
+                return None
+            items = list(getattr(response.data, "items", None) or [])
+            if not items:
+                return None
+            item = items[0]
+            sender = getattr(item, "sender", None)
+            open_id = str(getattr(sender, "id", "") or "").strip()
+            msg_type = str(getattr(item, "msg_type", "text") or "text")
+            body = getattr(item, "body", None)
+            body_content = str(getattr(body, "content", "") or "") if body else ""
+            try:
+                content_json = json.loads(body_content) if body_content else {}
+            except json.JSONDecodeError:
+                content_json = {}
+            text = self._extract_message_text(msg_type, content_json)
+            return (open_id, text) if text else None
+        except Exception as e:
+            logger.debug("Error fetching parent message {}: {}", parent_id, e)
+            return None
+
+    async def _fetch_parent_message(self, parent_id: str) -> tuple[str, str] | None:
+        """Async wrapper around _fetch_parent_message_sync."""
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, self._fetch_parent_message_sync, parent_id)
+
+    def _fetch_user_name_sync(self, open_id: str) -> str | None:
+        """Fetch the display name for a user open_id via Feishu contact API."""
+        try:
+            from lark_oapi.api.contact.v3 import GetUserRequest
+        except ImportError:
+            return None
+        try:
+            request = (
+                GetUserRequest.builder()
+                .user_id(open_id)
+                .user_id_type("open_id")
+                .build()
+            )
+            response = self._client.contact.v3.user.get(request)
+            if not response.success():
+                return None
+            user = getattr(response.data, "user", None)
+            name = str(getattr(user, "name", "") or "").strip() if user else ""
+            return name or None
+        except Exception as e:
+            logger.debug("Failed to fetch display name for {}: {}", open_id, e)
+            return None
+
+    async def _get_user_display_name(self, open_id: str) -> str:
+        """Return cached display name for open_id, fetching from API on first access.
+
+        Falls back to a short suffix of the open_id if the API call fails or
+        the contact permission is not granted.
+        """
+        if open_id in self._user_name_cache:
+            return self._user_name_cache[open_id]
+        short = open_id[-6:] if len(open_id) > 6 else (open_id or "?")
+        loop = asyncio.get_running_loop()
+        name = await loop.run_in_executor(None, self._fetch_user_name_sync, open_id)
+        display = name if name else f"用户_{short}"
+        self._user_name_cache[open_id] = display
+        # Keep cache bounded
+        while len(self._user_name_cache) > 500:
+            self._user_name_cache.pop(next(iter(self._user_name_cache)))
+        return display
 
     def _on_message_sync(self, data: "P2ImMessageReceiveV1") -> None:
         """
@@ -1319,6 +1414,11 @@ class FeishuChannel(BaseChannel):
                     if not should_reply:
                         return
 
+            # Permission check before creating any visible artifacts (reaction / progress card).
+            if not self.is_allowed(sender_id):
+                logger.warning("Feishu: access denied for sender {}", sender_id)
+                return
+
             # Add reaction and track it for completion cleanup.
             reaction_id = await self._add_reaction(message_id, self.config.react_emoji)
             if reaction_id:
@@ -1336,7 +1436,7 @@ class FeishuChannel(BaseChannel):
             if msg_type == "text":
                 text = content_json.get("text", "")
                 if text:
-                    content_parts.append(text)
+                    content_parts.append(self._clean_at_tags(text))
 
             elif msg_type == "post":
                 text, image_keys = _extract_post_content(content_json)
@@ -1371,16 +1471,40 @@ class FeishuChannel(BaseChannel):
             if not content and not media_paths:
                 return
 
-            # Prepend recent group chat history as context for the AI
+            # Inject sender label so the AI knows who is speaking in group chats (问题4+5)
+            if is_group and content:
+                sender_name = await self._get_user_display_name(sender_id)
+                content = f"[{sender_name}]: {content}"
+
+            # Build context prefix: recent group history + quoted/replied-to message
+            context_prefix_parts: list[str] = []
+
             if is_group and self.config.group_context_count > 0:
                 context_msgs = await self._fetch_group_context(
                     chat_id, self.config.group_context_count, message_id
                 )
                 if context_msgs:
-                    history_lines = "\n".join(
-                        f"[用户_{sid}]: {text}" for sid, text in context_msgs
+                    unique_ids = list({oid for oid, _ in context_msgs})
+                    names = await asyncio.gather(
+                        *[self._get_user_display_name(oid) for oid in unique_ids]
                     )
-                    content = f"[群聊近期消息]\n{history_lines}\n\n[当前消息]\n{content}"
+                    name_map = dict(zip(unique_ids, names))
+                    history_lines = "\n".join(
+                        f"[{name_map.get(oid, oid[-6:])}]: {text}" for oid, text in context_msgs
+                    )
+                    context_prefix_parts.append(f"[群聊近期消息]\n{history_lines}")
+
+            # If this message is a reply, include the quoted message (问题3)
+            parent_id = str(getattr(message, "parent_id", "") or "").strip()
+            if parent_id:
+                parent_msg = await self._fetch_parent_message(parent_id)
+                if parent_msg:
+                    p_oid, p_text = parent_msg
+                    p_name = await self._get_user_display_name(p_oid)
+                    context_prefix_parts.append(f"[被引用的消息 - {p_name}]\n{p_text}")
+
+            if context_prefix_parts:
+                content = "\n\n".join(context_prefix_parts) + f"\n\n[当前消息]\n{content}"
 
             # Forward to message bus
             await self._handle_message(

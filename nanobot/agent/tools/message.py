@@ -94,6 +94,10 @@ class MessageTool(Tool):
                 "sticker_file_key": {
                     "type": "string",
                     "description": "Optional: Feishu sticker file_key shortcut. Sets msg_type='sticker' automatically."
+                },
+                "use_recent_sticker": {
+                    "type": "boolean",
+                    "description": "Optional: for Feishu only, load the latest saved sticker file_key for current chat."
                 }
             },
             "required": ["content"]
@@ -108,6 +112,7 @@ class MessageTool(Tool):
         msg_type: str | None = None,
         feishu_content: dict[str, Any] | str | None = None,
         sticker_file_key: str | None = None,
+        use_recent_sticker: bool = False,
         media: list[str] | None = None,
         **kwargs: Any
     ) -> str:
@@ -124,6 +129,14 @@ class MessageTool(Tool):
         metadata: dict[str, Any] = {
             "message_id": message_id,
         }
+        if channel == "feishu" and use_recent_sticker and sticker_file_key is None:
+            from nanobot.channels.feishu_sticker_store import latest_chat_sticker
+
+            latest = latest_chat_sticker(chat_id)
+            if latest is None:
+                return "Error: no recent sticker found for current chat"
+            sticker_file_key = str((latest or {}).get("file_key") or "").strip()
+
         if channel == "feishu" and sticker_file_key is not None:
             file_key = sticker_file_key.strip()
             if not file_key:

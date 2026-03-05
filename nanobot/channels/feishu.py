@@ -16,6 +16,7 @@ from loguru import logger
 from nanobot.bus.events import OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
+from nanobot.channels.feishu_sticker_store import record_sticker
 from nanobot.config.schema import FeishuConfig
 
 try:
@@ -1262,7 +1263,10 @@ class FeishuChannel(BaseChannel):
         elif msg_type == "post":
             raw, _ = _extract_post_content(content_json)
             text = raw or ""
-        elif msg_type in ("image", "audio", "file", "media", "sticker"):
+        elif msg_type == "sticker":
+            file_key = str(content_json.get("file_key", "")).strip()
+            text = f"[sticker file_key: {file_key}]" if file_key else "[sticker]"
+        elif msg_type in ("image", "audio", "file", "media"):
             text = MSG_TYPE_MAP.get(msg_type, f"[{msg_type}]")
         elif msg_type in ("share_chat", "share_user", "interactive", "share_calendar_event", "system", "merge_forward"):
             text = _extract_share_card_content(content_json, msg_type)
@@ -1498,6 +1502,18 @@ class FeishuChannel(BaseChannel):
                 content_json = json.loads(message.content) if message.content else {}
             except json.JSONDecodeError:
                 content_json = {}
+            sticker_file_key = ""
+            if msg_type == "sticker":
+                sticker_file_key = str(content_json.get("file_key", "")).strip()
+                if sticker_file_key:
+                    # Persist sticker keys even when this message doesn't trigger an AI response.
+                    record_sticker(
+                        chat_id=chat_id,
+                        sender_id=sender_id,
+                        file_key=sticker_file_key,
+                        message_id=message_id,
+                        create_time_ms=str(getattr(message, "create_time", "") or ""),
+                    )
             text_content = str(content_json.get("text", "")).strip() if msg_type == "text" else ""
             is_slash_command = bool(text_content.startswith("/"))
             was_mentioned = False
@@ -1555,11 +1571,16 @@ class FeishuChannel(BaseChannel):
                         media_paths.append(file_path)
                     content_parts.append(content_text)
 
-            elif msg_type in ("image", "audio", "file", "media"):
-                file_path, content_text = await self._download_and_save_media(msg_type, content_json, message_id)
-                if file_path:
-                    media_paths.append(file_path)
-                content_parts.append(content_text)
+            elif msg_type in ("image", "audio", "file", "media", "sticker"):
+                if msg_type == "sticker":
+                    content_parts.append(
+                        f"[sticker file_key: {sticker_file_key}]" if sticker_file_key else "[sticker]"
+                    )
+                else:
+                    file_path, content_text = await self._download_and_save_media(msg_type, content_json, message_id)
+                    if file_path:
+                        media_paths.append(file_path)
+                    content_parts.append(content_text)
 
             elif msg_type in ("share_chat", "share_user", "interactive", "share_calendar_event", "system", "merge_forward"):
                 # Handle share cards and interactive messages
@@ -1620,6 +1641,7 @@ class FeishuChannel(BaseChannel):
                     "message_id": message_id,
                     "chat_type": chat_type,
                     "msg_type": msg_type,
+                    "sticker_file_key": sticker_file_key if msg_type == "sticker" else "",
                     "is_group": is_group,
                     "group_sender_id": sender_id if is_group else "",
                     "was_mentioned": was_mentioned,

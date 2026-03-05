@@ -8,6 +8,7 @@ import pytest
 from nanobot.bus.events import OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.feishu import FeishuChannel, _extract_post_content
+from nanobot.channels.feishu_sticker_store import list_chat_stickers
 from nanobot.config.schema import FeishuConfig
 
 
@@ -252,6 +253,45 @@ async def test_on_message_group_mention_policy_ignores_non_mention(monkeypatch) 
     channel._add_reaction.assert_not_awaited()
     create_card.assert_not_awaited()
     channel._handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_on_message_group_sticker_is_saved_even_without_mention(monkeypatch, tmp_path: Path) -> None:
+    channel = _make_channel()
+    channel.config.group_policy = "mention"
+    channel.config.bot_open_id = "ou_bot"
+    channel.config.proactive_reply_probability = 0.0
+    channel._add_reaction = AsyncMock(return_value="reaction_ignored")
+    channel._handle_message = AsyncMock()
+    create_card = AsyncMock()
+    monkeypatch.setattr(channel, "_create_processing_card_for_message", create_card)
+    sticker_store_path = tmp_path / "feishu_stickers.json"
+    monkeypatch.setattr("nanobot.channels.feishu_sticker_store.default_store_path", lambda: sticker_store_path)
+
+    data = SimpleNamespace(
+        event=SimpleNamespace(
+            message=SimpleNamespace(
+                message_id="om_sticker_1",
+                chat_id="oc_group",
+                chat_type="group",
+                message_type="sticker",
+                create_time="1710000000000",
+                content=json.dumps({"file_key": "file_v2_sticker_xxx"}),
+            ),
+            sender=SimpleNamespace(
+                sender_type="user",
+                sender_id=SimpleNamespace(open_id="ou_user"),
+            ),
+        )
+    )
+
+    await channel._on_message(data)
+
+    channel._add_reaction.assert_not_awaited()
+    create_card.assert_not_awaited()
+    channel._handle_message.assert_not_awaited()
+    saved = list_chat_stickers("oc_group", path=sticker_store_path)
+    assert saved and saved[0]["file_key"] == "file_v2_sticker_xxx"
 
 
 @pytest.mark.asyncio

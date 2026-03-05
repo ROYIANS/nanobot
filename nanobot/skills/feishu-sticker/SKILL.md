@@ -26,7 +26,20 @@ Example:
 }
 ```
 
+Reuse latest saved sticker in current chat:
+
+```json
+{
+  "content": "",
+  "channel": "feishu",
+  "chat_id": "oc_xxx",
+  "use_recent_sticker": true
+}
+```
+
 ## Notes
 
 - `sticker_file_key` auto-sets `msg_type="sticker"` and payload `{"file_key":"..."}`.
 - Sticker sending is forced to **non-quote mode** (no reply reference to source message).
+- Received sticker keys are persisted at `~/.nanobot/feishu_stickers.json` by chat.
+- If user asks to reuse "just sent sticker", read latest key from that store for current chat.

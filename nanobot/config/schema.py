@@ -3,7 +3,7 @@
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 from pydantic.alias_generators import to_camel
 from pydantic_settings import BaseSettings
 
@@ -247,9 +247,18 @@ class AgentsConfig(Base):
 class ProviderConfig(Base):
     """LLM provider configuration."""
 
-    api_key: str = ""
+    api_key: str = Field(default="", validation_alias=AliasChoices("api_key", "apiKey", "apikey"))
     api_base: str | None = None
     extra_headers: dict[str, str] | None = None  # Custom headers (e.g. APP-Code for AiHubMix)
+
+    @property
+    def apikey(self) -> str:
+        """Backward-compatible alias for legacy code paths."""
+        return self.api_key
+
+    @apikey.setter
+    def apikey(self, value: str) -> None:
+        self.api_key = value
 
 
 class ProvidersConfig(Base):

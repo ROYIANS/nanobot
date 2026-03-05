@@ -7,7 +7,7 @@ from typer.testing import CliRunner
 
 from nanobot.agent.skills import SkillsLoader
 from nanobot.cli.commands import app
-from nanobot.config.schema import Config
+from nanobot.config.schema import Config, ProviderConfig
 from nanobot.providers.litellm_provider import LiteLLMProvider
 from nanobot.providers.openai_codex_provider import _strip_model_prefix
 from nanobot.providers.registry import find_by_model
@@ -118,6 +118,29 @@ def test_config_matches_ikuncode_when_explicit_provider_selected():
 
     assert config.get_provider_name("gpt-4.1-mini") == "ikuncode"
     assert config.get_api_base("gpt-4.1-mini") == "https://api.ikuncode.cc/v1"
+
+
+def test_provider_config_supports_legacy_apikey_attribute():
+    provider = ProviderConfig(api_key="sk-current")
+
+    assert provider.apikey == "sk-current"
+
+    provider.apikey = "sk-legacy"
+    assert provider.api_key == "sk-legacy"
+
+
+def test_config_accepts_legacy_apikey_key_in_input():
+    config = Config.model_validate(
+        {
+            "providers": {
+                "ikuncode": {
+                    "apikey": "sk-legacy",
+                }
+            }
+        }
+    )
+
+    assert config.providers.ikuncode.api_key == "sk-legacy"
 
 
 def test_find_by_model_prefers_explicit_prefix_over_generic_codex_keyword():

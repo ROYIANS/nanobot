@@ -45,10 +45,10 @@ SUPPORTED_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
 
 
 class IkunImageTool(Tool):
-    """AI 图片生成器（ikun 渠道，NanoBananaPro / gemini-3-pro-image-preview）。
+    """Image generation tool for ikuncode (NanoBananaPro / Gemini image model).
 
-    单渠道设计，支持文生图、图生图编辑、并发批量生成。
-    所有图片严格遵循中国风格，提示词统一使用中文。
+    Supports text-to-image, image editing, and concurrent batch generation.
+    Style and language are fully user-controlled.
     """
 
     def __init__(
@@ -70,12 +70,10 @@ class IkunImageTool(Tool):
     @property
     def description(self) -> str:
         return (
-            "生成或编辑图片（ikun 渠道，NanoBananaPro 模型）。"
-            "支持文生图、图生图编辑、并发批量生成。"
-            "所有图片必须遵循中国风格：中国面孔、中式服装（汉服/旗袍/新中式/国潮）、"
-            "中国场景（江南水乡/古镇/故宫/竹林）、东方美学。"
-            "提示词统一使用中文撰写。"
-            "输出至 outimage/ikunimage/{YYYYMMDD}_{HHMM}_{主题简称}.png。"
+            "Generate or edit images via ikuncode (NanoBananaPro model). "
+            "Supports text-to-image, image editing, and concurrent batch generation. "
+            "Style and language are user-controlled; follow the user's prompt as-is. "
+            "Outputs to outimage/ikunimage/{YYYYMMDD}_{HHMM}_{slug}.png by default."
         )
 
     @property
@@ -86,7 +84,7 @@ class IkunImageTool(Tool):
                 "prompt": {
                     "type": "string",
                     "minLength": 1,
-                    "description": "图片描述提示词（中文，遵循中国风格）。批量模式下可省略。",
+                    "description": "Image prompt (free style, any language). Optional in batch mode.",
                 },
                 "input_image": {
                     "type": "string",

@@ -976,6 +976,56 @@ class FeishuChannel(BaseChannel):
             logger.error("Error sending Feishu {} message: {}", msg_type, e)
             return None
 
+    def _reply_message_sync(self, parent_message_id: str, msg_type: str, content: str) -> str | None:
+        """Reply to a Feishu message natively (thread reply) and return message_id."""
+        try:
+            from lark_oapi.api.im.v1 import ReplyMessageRequest, ReplyMessageRequestBody
+        except ImportError:
+            logger.warning("ReplyMessageRequest not available; falling back to normal send")
+            return None
+
+        try:
+            request = ReplyMessageRequest.builder() \
+                .message_id(parent_message_id) \
+                .request_body(
+                    ReplyMessageRequestBody.builder()
+                    .msg_type(msg_type)
+                    .content(content)
+                    .build()
+                ).build()
+            response = self._client.im.v1.message.reply(request)
+            if not response.success():
+                logger.error(
+                    "Failed to reply Feishu {} message: code={}, msg={}, log_id={}",
+                    msg_type, response.code, response.msg, response.get_log_id()
+                )
+                return None
+            logger.debug("Feishu {} message replied to {}", msg_type, parent_message_id)
+            return getattr(response.data, "message_id", None)
+        except Exception as e:
+            logger.error("Error replying Feishu {} message: {}", msg_type, e)
+            return None
+
+    def _send_with_optional_reply_sync(
+        self,
+        receive_id_type: str,
+        receive_id: str,
+        msg_type: str,
+        content: str,
+        reply_to_message_id: str | None = None,
+    ) -> str | None:
+        """Reply in-thread when possible; always fallback to normal send for reliability."""
+        if reply_to_message_id:
+            replied_message_id = self._reply_message_sync(reply_to_message_id, msg_type, content)
+            if replied_message_id:
+                return replied_message_id
+            logger.warning(
+                "Feishu reply failed, fallback to normal send: parent_message_id={} msg_type={}",
+                reply_to_message_id,
+                msg_type,
+            )
+        return self._send_message_sync(receive_id_type, receive_id, msg_type, content)
+
     async def send(self, msg: OutboundMessage) -> None:
         """Send a message through Feishu, including media (images/files) if present."""
         if not self._client:
@@ -989,10 +1039,9 @@ class FeishuChannel(BaseChannel):
             source_message_id = str(msg.metadata.get("message_id", "")).strip()
             is_turn_done = bool(msg.metadata.get("_turn_done"))
             is_progress = bool(msg.metadata.get("_progress"))
-            # When reply_to_message is enabled, send as native Feishu thread reply quoting the user's message
-            if self.config.reply_to_message and source_message_id and not is_progress:
-                receive_id_type = "message_id"
-                receive_id = source_message_id
+            reply_to_message_id = source_message_id if (
+                self.config.reply_to_message and source_message_id and not is_progress
+            ) else None
             is_tool_hint = bool(msg.metadata.get("_tool_hint"))
             force_msg_type = str(msg.metadata.get("feishu_msg_type", "")).strip().lower()
             force_content = msg.metadata.get("feishu_content")
@@ -1013,8 +1062,10 @@ class FeishuChannel(BaseChannel):
                     key = await loop.run_in_executor(None, self._upload_image_sync, file_path)
                     if key:
                         await loop.run_in_executor(
-                            None, self._send_message_sync,
-                            receive_id_type, receive_id, "image", json.dumps({"image_key": key}, ensure_ascii=False),
+                            None, self._send_with_optional_reply_sync,
+                            receive_id_type, receive_id, "image",
+                            json.dumps({"image_key": key}, ensure_ascii=False),
+                            reply_to_message_id,
                         )
                 else:
                     duration_ms = self._probe_duration_ms(file_path) if ext in {".opus", ".mp4"} else None
@@ -1027,8 +1078,10 @@ class FeishuChannel(BaseChannel):
                     if key:
                         media_type = "audio" if ext in self._AUDIO_EXTS else "file"
                         await loop.run_in_executor(
-                            None, self._send_message_sync,
-                            receive_id_type, receive_id, media_type, json.dumps({"file_key": key}, ensure_ascii=False),
+                            None, self._send_with_optional_reply_sync,
+                            receive_id_type, receive_id, media_type,
+                            json.dumps({"file_key": key}, ensure_ascii=False),
+                            reply_to_message_id,
                         )
 
             if force_msg_type:
@@ -1046,11 +1099,12 @@ class FeishuChannel(BaseChannel):
                         )
                         await loop.run_in_executor(
                             None,
-                            self._send_message_sync,
+                            self._send_with_optional_reply_sync,
                             receive_id_type,
                             receive_id,
                             "text",
                             json.dumps({"text": msg.content}, ensure_ascii=False),
+                            reply_to_message_id,
                         )
                     else:
                         logger.warning(
@@ -1062,16 +1116,19 @@ class FeishuChannel(BaseChannel):
                         payload = json.dumps(payload, ensure_ascii=False)
                     await loop.run_in_executor(
                         None,
-                        self._send_message_sync,
+                        self._send_with_optional_reply_sync,
                         receive_id_type,
                         receive_id,
                         force_msg_type,
                         payload,
+                        reply_to_message_id,
                     )
             elif msg.content and msg.content.strip():
                 await loop.run_in_executor(
-                    None, self._send_message_sync,
-                    receive_id_type, receive_id, "text", json.dumps({"text": msg.content}, ensure_ascii=False),
+                    None, self._send_with_optional_reply_sync,
+                    receive_id_type, receive_id, "text",
+                    json.dumps({"text": msg.content}, ensure_ascii=False),
+                    reply_to_message_id,
                 )
 
             # Only clear reaction when agent explicitly marks this turn as complete.
@@ -1214,6 +1271,32 @@ class FeishuChannel(BaseChannel):
             text = text[:self._CONTEXT_MAX_TEXT_LEN] + "..."
         return text
 
+    @staticmethod
+    def _extract_sender_open_id(sender: Any) -> str:
+        """Extract sender open_id robustly across SDK payload shapes."""
+        if not sender:
+            return ""
+        direct_candidates = (
+            getattr(sender, "id", None),
+            getattr(sender, "open_id", None),
+            getattr(sender, "user_id", None),
+        )
+        for candidate in direct_candidates:
+            value = str(candidate or "").strip()
+            if value:
+                return value
+        sender_id = getattr(sender, "sender_id", None)
+        nested_candidates = (
+            getattr(sender_id, "open_id", None),
+            getattr(sender_id, "user_id", None),
+            getattr(sender_id, "union_id", None),
+        )
+        for candidate in nested_candidates:
+            value = str(candidate or "").strip()
+            if value:
+                return value
+        return ""
+
     def _fetch_group_context_sync(
         self, chat_id: str, count: int, current_msg_id: str
     ) -> list[tuple[str, str]]:
@@ -1234,11 +1317,11 @@ class FeishuChannel(BaseChannel):
             )
             try:
                 builder = builder.sort_type("ByCreateTimeDesc")
-            except AttributeError:
-                pass  # older SDK version without sort_type
+            except Exception:
+                pass  # older SDK versions may not support sort_type
             try:
                 builder = builder.page_size(min(count + 5, 50))
-            except AttributeError:
+            except Exception:
                 pass
             request = builder.build()
 
@@ -1264,7 +1347,7 @@ class FeishuChannel(BaseChannel):
                 if sender_type == "bot":
                     continue  # exclude bot replies
 
-                sender_id = str(getattr(sender, "id", "") or "").strip()
+                sender_id = self._extract_sender_open_id(sender)
 
                 msg_type = str(getattr(item, "msg_type", "text") or "text")
                 body = getattr(item, "body", None)
@@ -1313,7 +1396,7 @@ class FeishuChannel(BaseChannel):
                 return None
             item = items[0]
             sender = getattr(item, "sender", None)
-            open_id = str(getattr(sender, "id", "") or "").strip()
+            open_id = self._extract_sender_open_id(sender)
             msg_type = str(getattr(item, "msg_type", "text") or "text")
             body = getattr(item, "body", None)
             body_content = str(getattr(body, "content", "") or "") if body else ""

@@ -88,6 +88,40 @@ async def test_send_uses_text_message_type(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
+async def test_send_reply_mode_fallback_keeps_chat_id_receive_type(monkeypatch) -> None:
+    channel = _make_channel()
+    channel.config.reply_to_message = True
+    sent_calls: list[tuple[str, str, str, str]] = []
+
+    monkeypatch.setattr(channel, "_reply_message_sync", lambda *_args, **_kwargs: None)
+
+    def _fake_send(receive_id_type: str, receive_id: str, msg_type: str, content: str) -> str:
+        sent_calls.append((receive_id_type, receive_id, msg_type, content))
+        return "om_sent"
+
+    monkeypatch.setattr(channel, "_send_message_sync", _fake_send)
+
+    await channel.send(
+        OutboundMessage(
+            channel="feishu",
+            chat_id="oc_group",
+            content="hello",
+            metadata={"message_id": "om_source"},
+        )
+    )
+
+    assert len(sent_calls) == 1
+    assert sent_calls[0][0] == "chat_id"
+    assert sent_calls[0][1] == "oc_group"
+    assert sent_calls[0][2] == "text"
+
+
+def test_extract_sender_open_id_supports_nested_sender_id_shape() -> None:
+    sender = SimpleNamespace(sender_id=SimpleNamespace(open_id="ou_nested"))
+    assert FeishuChannel._extract_sender_open_id(sender) == "ou_nested"
+
+
+@pytest.mark.asyncio
 async def test_on_message_records_reaction_id_for_cleanup(monkeypatch) -> None:
     channel = _make_channel()
     channel._add_reaction = AsyncMock(return_value="reaction_1")

@@ -98,6 +98,15 @@ class SubagentManager:
         try:
             # Build subagent tools (no message tool, no spawn tool)
             tools = ToolRegistry()
+            ikuncode_api_key = None
+            ikuncode_api_base = None
+            if self.ikuncode_config:
+                # Backward/forward compatibility: accept both api_key and legacy apikey.
+                ikuncode_api_key = (
+                    getattr(self.ikuncode_config, "api_key", None)
+                    or getattr(self.ikuncode_config, "apikey", None)
+                )
+                ikuncode_api_base = getattr(self.ikuncode_config, "api_base", None)
             allowed_dir = self.workspace if self.restrict_to_workspace else None
             tools.register(ReadFileTool(workspace=self.workspace, allowed_dir=allowed_dir))
             tools.register(WriteFileTool(workspace=self.workspace, allowed_dir=allowed_dir))
@@ -114,8 +123,8 @@ class SubagentManager:
             tools.register(
                 IkunImageTool(
                     workspace=self.workspace,
-                    api_key=(self.ikuncode_config.api_key if self.ikuncode_config else None),
-                    api_base=(self.ikuncode_config.api_base if self.ikuncode_config else None),
+                    api_key=ikuncode_api_key,
+                    api_base=ikuncode_api_base,
                 )
             )
             

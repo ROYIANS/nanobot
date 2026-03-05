@@ -131,6 +131,15 @@ class AgentLoop:
     def _register_default_tools(self) -> None:
         """Register the default set of tools."""
         allowed_dir = self.workspace if self.restrict_to_workspace else None
+        ikuncode_api_key = None
+        ikuncode_api_base = None
+        if self.ikuncode_config:
+            # Backward/forward compatibility: accept both api_key and legacy apikey.
+            ikuncode_api_key = (
+                getattr(self.ikuncode_config, "api_key", None)
+                or getattr(self.ikuncode_config, "apikey", None)
+            )
+            ikuncode_api_base = getattr(self.ikuncode_config, "api_base", None)
         for cls in (ReadFileTool, WriteFileTool, EditFileTool, ListDirTool):
             self.tools.register(cls(workspace=self.workspace, allowed_dir=allowed_dir))
         self.tools.register(ExecTool(
@@ -144,8 +153,8 @@ class AgentLoop:
         self.tools.register(
             IkunImageTool(
                 workspace=self.workspace,
-                api_key=(self.ikuncode_config.api_key if self.ikuncode_config else None),
-                api_base=(self.ikuncode_config.api_base if self.ikuncode_config else None),
+                api_key=ikuncode_api_key,
+                api_base=ikuncode_api_base,
             )
         )
         self.tools.register(MessageTool(send_callback=self.bus.publish_outbound))

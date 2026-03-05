@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 
-def _make_loop():
+def _make_loop(ikuncode_config=None):
     """Create a minimal AgentLoop with mocked dependencies."""
     from nanobot.agent.loop import AgentLoop
     from nanobot.bus.queue import MessageBus
@@ -23,8 +23,19 @@ def _make_loop():
          patch("nanobot.agent.loop.SessionManager"), \
          patch("nanobot.agent.loop.SubagentManager") as MockSubMgr:
         MockSubMgr.return_value.cancel_by_session = AsyncMock(return_value=0)
-        loop = AgentLoop(bus=bus, provider=provider, workspace=workspace)
+        loop = AgentLoop(
+            bus=bus,
+            provider=provider,
+            workspace=workspace,
+            ikuncode_config=ikuncode_config,
+        )
     return loop, bus
+
+
+def test_loop_init_accepts_api_key_only_ikuncode_config():
+    from types import SimpleNamespace
+
+    _make_loop(ikuncode_config=SimpleNamespace(api_key="sk-test", api_base="https://api.ikuncode.cc"))
 
 
 class TestHandleStop:

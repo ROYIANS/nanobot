@@ -90,6 +90,10 @@ class MessageTool(Tool):
                     "type": "array",
                     "items": {"type": "string"},
                     "description": "Optional: list of file paths to attach (images, audio, documents)"
+                },
+                "sticker_file_key": {
+                    "type": "string",
+                    "description": "Optional: Feishu sticker file_key shortcut. Sets msg_type='sticker' automatically."
                 }
             },
             "required": ["content"]
@@ -103,6 +107,7 @@ class MessageTool(Tool):
         message_id: str | None = None,
         msg_type: str | None = None,
         feishu_content: dict[str, Any] | str | None = None,
+        sticker_file_key: str | None = None,
         media: list[str] | None = None,
         **kwargs: Any
     ) -> str:
@@ -119,12 +124,24 @@ class MessageTool(Tool):
         metadata: dict[str, Any] = {
             "message_id": message_id,
         }
+        if channel == "feishu" and sticker_file_key is not None:
+            file_key = sticker_file_key.strip()
+            if not file_key:
+                return "Error: sticker_file_key cannot be empty"
+            if msg_type and msg_type.strip().lower() != "sticker":
+                return "Error: sticker_file_key requires msg_type='sticker' when msg_type is provided"
+            msg_type = "sticker"
+            if feishu_content is None:
+                feishu_content = {"file_key": file_key}
+
         if channel == "feishu" and msg_type:
             normalized = msg_type.strip().lower()
             if normalized not in self._FEISHU_MSG_TYPES:
                 supported = ", ".join(sorted(self._FEISHU_MSG_TYPES))
                 return f"Error: unsupported feishu msg_type='{normalized}'. Supported: {supported}"
             metadata["feishu_msg_type"] = normalized
+            if normalized == "sticker":
+                metadata["feishu_disable_reply_quote"] = True
 
             payload = feishu_content
             if payload is None and normalized == "system" and kwargs.get("feishu_system_content") is not None:

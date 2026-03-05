@@ -72,3 +72,22 @@ async def test_message_tool_validates_required_field_for_share_user() -> None:
     )
 
     assert "requires non-empty 'user_id'" in result
+
+
+@pytest.mark.asyncio
+async def test_message_tool_supports_sticker_file_key_shortcut_and_disables_reply_quote() -> None:
+    sent = []
+    tool = MessageTool(send_callback=AsyncMock(side_effect=lambda m: sent.append(m)))
+
+    result = await tool.execute(
+        content="",
+        channel="feishu",
+        chat_id="oc_group",
+        sticker_file_key="file_v2_sticker_xxx",
+    )
+
+    assert "Message sent to feishu:oc_group" in result
+    assert len(sent) == 1
+    assert sent[0].metadata["feishu_msg_type"] == "sticker"
+    assert sent[0].metadata["feishu_content"]["file_key"] == "file_v2_sticker_xxx"
+    assert sent[0].metadata["feishu_disable_reply_quote"] is True

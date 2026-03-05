@@ -1039,11 +1039,12 @@ class FeishuChannel(BaseChannel):
             source_message_id = str(msg.metadata.get("message_id", "")).strip()
             is_turn_done = bool(msg.metadata.get("_turn_done"))
             is_progress = bool(msg.metadata.get("_progress"))
+            force_msg_type = str(msg.metadata.get("feishu_msg_type", "")).strip().lower()
+            disable_reply_quote = bool(msg.metadata.get("feishu_disable_reply_quote")) or force_msg_type == "sticker"
             reply_to_message_id = source_message_id if (
-                self.config.reply_to_message and source_message_id and not is_progress
+                self.config.reply_to_message and source_message_id and not is_progress and not disable_reply_quote
             ) else None
             is_tool_hint = bool(msg.metadata.get("_tool_hint"))
-            force_msg_type = str(msg.metadata.get("feishu_msg_type", "")).strip().lower()
             force_content = msg.metadata.get("feishu_content")
             force_system_content = msg.metadata.get("feishu_system_content")
 

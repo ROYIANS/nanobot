@@ -116,6 +116,45 @@ async def test_send_reply_mode_fallback_keeps_chat_id_receive_type(monkeypatch) 
     assert sent_calls[0][2] == "text"
 
 
+@pytest.mark.asyncio
+async def test_send_sticker_does_not_quote_source_message(monkeypatch) -> None:
+    channel = _make_channel()
+    channel.config.reply_to_message = True
+    sent_calls: list[tuple[str, str, str, str]] = []
+    reply_calls: list[str] = []
+
+    def _fake_reply(parent_message_id: str, msg_type: str, content: str) -> str | None:
+        reply_calls.append(parent_message_id)
+        return "om_reply"
+
+    def _fake_send(receive_id_type: str, receive_id: str, msg_type: str, content: str) -> str:
+        sent_calls.append((receive_id_type, receive_id, msg_type, content))
+        return "om_sent"
+
+    monkeypatch.setattr(channel, "_reply_message_sync", _fake_reply)
+    monkeypatch.setattr(channel, "_send_message_sync", _fake_send)
+
+    await channel.send(
+        OutboundMessage(
+            channel="feishu",
+            chat_id="oc_group",
+            content="",
+            metadata={
+                "message_id": "om_source",
+                "feishu_msg_type": "sticker",
+                "feishu_content": {"file_key": "file_v2_sticker_xxx"},
+            },
+        )
+    )
+
+    assert reply_calls == []
+    assert len(sent_calls) == 1
+    assert sent_calls[0][0] == "chat_id"
+    assert sent_calls[0][1] == "oc_group"
+    assert sent_calls[0][2] == "sticker"
+    assert json.loads(sent_calls[0][3]) == {"file_key": "file_v2_sticker_xxx"}
+
+
 def test_extract_sender_open_id_supports_nested_sender_id_shape() -> None:
     sender = SimpleNamespace(sender_id=SimpleNamespace(open_id="ou_nested"))
     assert FeishuChannel._extract_sender_open_id(sender) == "ou_nested"

@@ -35,6 +35,7 @@ class MessageTool(Tool):
         self._default_chat_id = default_chat_id
         self._default_message_id = default_message_id
         self._sent_in_turn: bool = False
+        self._sent_signatures: set[str] = set()
 
     def set_context(self, channel: str, chat_id: str, message_id: str | None = None) -> None:
         """Set the current message context."""
@@ -49,6 +50,7 @@ class MessageTool(Tool):
     def start_turn(self) -> None:
         """Reset per-turn send tracking."""
         self._sent_in_turn = False
+        self._sent_signatures.clear()
 
     @property
     def name(self) -> str:
@@ -183,15 +185,36 @@ class MessageTool(Tool):
             media=media or [],
             metadata=metadata,
         )
+        signature = self._build_send_signature(msg)
+        media_info = f" with {len(media)} attachments" if media else ""
+
+        if signature in self._sent_signatures:
+            return f"Duplicate message skipped for {channel}:{chat_id}{media_info}"
 
         try:
             await self._send_callback(msg)
+            self._sent_signatures.add(signature)
             if channel == self._default_channel and chat_id == self._default_chat_id:
                 self._sent_in_turn = True
-            media_info = f" with {len(media)} attachments" if media else ""
             return f"Message sent to {channel}:{chat_id}{media_info}"
         except Exception as e:
             return f"Error sending message: {str(e)}"
+
+    @staticmethod
+    def _build_send_signature(msg: OutboundMessage) -> str:
+        return json.dumps(
+            {
+                "channel": msg.channel,
+                "chat_id": msg.chat_id,
+                "reply_to": msg.reply_to,
+                "content": msg.content,
+                "media": list(msg.media or []),
+                "metadata": msg.metadata or {},
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
 
     @staticmethod
     def _as_dict_payload(payload: dict[str, Any] | str, msg_type: str) -> tuple[dict[str, Any] | None, str | None]:

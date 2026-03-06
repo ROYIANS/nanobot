@@ -31,6 +31,39 @@ class TestMessageToolFinalReplyLogic:
     """Final reply behavior when message tool is used in the same turn."""
 
     @pytest.mark.asyncio
+    async def test_deduplicates_identical_message_tool_calls_in_same_turn(self, tmp_path: Path) -> None:
+        loop = _make_loop(tmp_path)
+        first_call = ToolCallRequest(
+            id="call1",
+            name="message",
+            arguments={"content": "Hello", "channel": "feishu", "chat_id": "chat123"},
+        )
+        second_call = ToolCallRequest(
+            id="call2",
+            name="message",
+            arguments={"content": "Hello", "channel": "feishu", "chat_id": "chat123"},
+        )
+        calls = iter([
+            LLMResponse(content="", tool_calls=[first_call]),
+            LLMResponse(content="", tool_calls=[second_call]),
+            LLMResponse(content="Done", tool_calls=[]),
+        ])
+        loop.provider.chat = AsyncMock(side_effect=lambda *a, **kw: next(calls))
+        loop.tools.get_definitions = MagicMock(return_value=[])
+
+        sent: list[OutboundMessage] = []
+        mt = loop.tools.get("message")
+        if isinstance(mt, MessageTool):
+            mt.set_send_callback(AsyncMock(side_effect=lambda m: sent.append(m)))
+
+        msg = InboundMessage(channel="feishu", sender_id="user1", chat_id="chat123", content="Send")
+        result = await loop._process_message(msg)
+
+        assert len(sent) == 1
+        assert sent[0].content == "Hello"
+        assert result is None
+
+    @pytest.mark.asyncio
     async def test_suppress_final_reply_when_sent_to_same_target_and_completed(self, tmp_path: Path) -> None:
         loop = _make_loop(tmp_path)
         tool_call = ToolCallRequest(

@@ -93,6 +93,8 @@ Your workspace is at: {workspace_path}
 - After writing or editing a file, re-read it if accuracy matters.
 - If a tool call fails, analyze the error before retrying with a different approach.
 - Ask for clarification when the request is ambiguous.
+- Do not end a turn with "I'll check/do X next"; if tools are available, do it in the same turn.
+- Continue autonomously until the task is done, unless blocked by missing permissions or a required user decision.
 
 Reply directly with text for conversations. Only use the 'message' tool to send to a specific chat channel."""
 

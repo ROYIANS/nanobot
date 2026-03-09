@@ -3,7 +3,7 @@
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 from pydantic.alias_generators import to_camel
 from pydantic_settings import BaseSettings
 
@@ -47,6 +47,14 @@ class FeishuConfig(Base):
     react_emoji: str = (
         "THUMBSUP"  # Emoji type for message reactions (e.g. THUMBSUP, OK, DONE, SMILE)
     )
+    group_policy: Literal["open", "mention", "allowlist"] = "mention"
+    group_allow_from: list[str] = Field(default_factory=list)
+    allow_room_mentions: bool = False
+    proactive_reply_probability: float = 0.0
+    bot_open_id: str = ""
+    admin_ids: list[str] = Field(default_factory=list)
+    group_context_count: int = 0  # Number of recent group messages to include as context (0 = disabled)
+    reply_to_message: bool = True  # If true, bot replies quote the user's original message
 
 
 class DingTalkConfig(Base):
@@ -242,9 +250,18 @@ class AgentsConfig(Base):
 class ProviderConfig(Base):
     """LLM provider configuration."""
 
-    api_key: str = ""
+    api_key: str = Field(default="", validation_alias=AliasChoices("api_key", "apiKey", "apikey"))
     api_base: str | None = None
     extra_headers: dict[str, str] | None = None  # Custom headers (e.g. APP-Code for AiHubMix)
+
+    @property
+    def apikey(self) -> str:
+        """Backward-compatible alias for legacy code paths."""
+        return self.api_key
+
+    @apikey.setter
+    def apikey(self, value: str) -> None:
+        self.api_key = value
 
 
 class ProvidersConfig(Base):
@@ -263,6 +280,7 @@ class ProvidersConfig(Base):
     gemini: ProviderConfig = Field(default_factory=ProviderConfig)
     moonshot: ProviderConfig = Field(default_factory=ProviderConfig)
     minimax: ProviderConfig = Field(default_factory=ProviderConfig)
+    ikuncode: ProviderConfig = Field(default_factory=ProviderConfig)
     aihubmix: ProviderConfig = Field(default_factory=ProviderConfig)  # AiHubMix API gateway
     siliconflow: ProviderConfig = Field(default_factory=ProviderConfig)  # SiliconFlow (硅基流动)
     volcengine: ProviderConfig = Field(default_factory=ProviderConfig)  # VolcEngine (火山引擎)

@@ -5,8 +5,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from typer.testing import CliRunner
 
+from nanobot.agent.skills import SkillsLoader
 from nanobot.cli.commands import app
-from nanobot.config.schema import Config
+from nanobot.config.schema import Config, ProviderConfig
 from nanobot.providers.litellm_provider import LiteLLMProvider
 from nanobot.providers.openai_codex_provider import _strip_model_prefix
 from nanobot.providers.registry import find_by_model
@@ -114,6 +115,38 @@ def test_config_matches_openai_codex_with_hyphen_prefix():
     assert config.get_provider_name() == "openai_codex"
 
 
+def test_config_matches_ikuncode_when_explicit_provider_selected():
+    config = Config()
+    config.agents.defaults.provider = "ikuncode"
+    config.providers.ikuncode.api_key = "sk-ikuncode"
+
+    assert config.get_provider_name("gpt-4.1-mini") == "ikuncode"
+    assert config.get_api_base("gpt-4.1-mini") == "https://api.ikuncode.cc/v1"
+
+
+def test_provider_config_supports_legacy_apikey_attribute():
+    provider = ProviderConfig(api_key="sk-current")
+
+    assert provider.apikey == "sk-current"
+
+    provider.apikey = "sk-legacy"
+    assert provider.api_key == "sk-legacy"
+
+
+def test_config_accepts_legacy_apikey_key_in_input():
+    config = Config.model_validate(
+        {
+            "providers": {
+                "ikuncode": {
+                    "apikey": "sk-legacy",
+                }
+            }
+        }
+    )
+
+    assert config.providers.ikuncode.api_key == "sk-legacy"
+
+
 def test_find_by_model_prefers_explicit_prefix_over_generic_codex_keyword():
     spec = find_by_model("github-copilot/gpt-5.3-codex")
 
@@ -132,6 +165,63 @@ def test_litellm_provider_canonicalizes_github_copilot_hyphen_prefix():
 def test_openai_codex_strip_prefix_supports_hyphen_and_underscore():
     assert _strip_model_prefix("openai-codex/gpt-5.1-codex") == "gpt-5.1-codex"
     assert _strip_model_prefix("openai_codex/gpt-5.1-codex") == "gpt-5.1-codex"
+
+
+def test_skills_loader_discovers_nested_superpowers_dirs(monkeypatch, tmp_path: Path):
+    workspace = tmp_path / "workspace"
+    builtin = tmp_path / "builtin"
+    external = tmp_path / "external"
+
+    (workspace / "skills").mkdir(parents=True, exist_ok=True)
+    (builtin / "native").mkdir(parents=True, exist_ok=True)
+    (external / ".system" / "skill-installer").mkdir(parents=True, exist_ok=True)
+
+    (builtin / "native" / "SKILL.md").write_text(
+        "---\nname: native\ndescription: native skill\n---\nbody\n", encoding="utf-8"
+    )
+    (external / ".system" / "skill-installer" / "SKILL.md").write_text(
+        "---\nname: skill-installer\ndescription: external skill\n---\nbody\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr("nanobot.agent.skills.DEFAULT_SUPERPOWERS_SKILL_DIRS", ())
+    monkeypatch.setenv("NANOBOT_SKILLS_EXTRA_DIRS", str(external))
+
+    loader = SkillsLoader(workspace=workspace, builtin_skills_dir=builtin)
+    skills = loader.list_skills(filter_unavailable=False)
+    names = {s["name"] for s in skills}
+    assert "native" in names
+    assert "skill-installer" in names
+
+
+def test_skills_loader_prefers_workspace_on_name_conflict(monkeypatch, tmp_path: Path):
+    workspace = tmp_path / "workspace"
+    builtin = tmp_path / "builtin"
+    external = tmp_path / "external"
+
+    (workspace / "skills" / "brainstorming").mkdir(parents=True, exist_ok=True)
+    (external / "brainstorming").mkdir(parents=True, exist_ok=True)
+    (builtin / "other").mkdir(parents=True, exist_ok=True)
+
+    (workspace / "skills" / "brainstorming" / "SKILL.md").write_text(
+        "---\nname: brainstorming\ndescription: workspace version\n---\nworkspace\n",
+        encoding="utf-8",
+    )
+    (external / "brainstorming" / "SKILL.md").write_text(
+        "---\nname: brainstorming\ndescription: external version\n---\nexternal\n",
+        encoding="utf-8",
+    )
+    (builtin / "other" / "SKILL.md").write_text(
+        "---\nname: other\ndescription: other\n---\nother\n", encoding="utf-8"
+    )
+
+    monkeypatch.setattr("nanobot.agent.skills.DEFAULT_SUPERPOWERS_SKILL_DIRS", ())
+    monkeypatch.setenv("NANOBOT_SKILLS_EXTRA_DIRS", str(external))
+
+    loader = SkillsLoader(workspace=workspace, builtin_skills_dir=builtin)
+    content = loader.load_skill("brainstorming")
+    assert content is not None
+    assert "workspace version" in content
 
 
 @pytest.fixture

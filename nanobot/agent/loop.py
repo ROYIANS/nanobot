@@ -7,6 +7,7 @@ import json
 import re
 import weakref
 from contextlib import AsyncExitStack
+from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
@@ -17,6 +18,7 @@ from nanobot.agent.memory import MemoryStore
 from nanobot.agent.subagent import SubagentManager
 from nanobot.agent.tools.cron import CronTool
 from nanobot.agent.tools.filesystem import EditFileTool, ListDirTool, ReadFileTool, WriteFileTool
+from nanobot.agent.tools.ikunimage import IkunImageTool
 from nanobot.agent.tools.message import MessageTool
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.shell import ExecTool
@@ -28,7 +30,7 @@ from nanobot.providers.base import LLMProvider
 from nanobot.session.manager import Session, SessionManager
 
 if TYPE_CHECKING:
-    from nanobot.config.schema import ChannelsConfig, ExecToolConfig
+    from nanobot.config.schema import ChannelsConfig, ExecToolConfig, ProviderConfig
     from nanobot.cron.service import CronService
 
 
@@ -45,6 +47,16 @@ class AgentLoop:
     """
 
     _TOOL_RESULT_MAX_CHARS = 500
+    _TASK_META_KEY = "active_task"
+    _MAX_ITER_MSG_PREFIX = "I reached the maximum number of tool call iterations"
+    _ADMIN_ONLY_TOOLS = {"write_file", "edit_file", "exec", "spawn"}
+    _IN_PROGRESS_PATTERNS = (
+        re.compile(
+            r"\b(i(?:'|’)ll|i will|next[, ]+i(?:'|’)ll|i'm going to|let me (?:check|look|inspect|review|fix|do|work on|continue|investigate))\b",
+            re.IGNORECASE,
+        ),
+        re.compile(r"(我先|我会先|接下来我会|下一步我会|稍后我会|让我先)"),
+    )
 
     def __init__(
         self,
@@ -65,10 +77,12 @@ class AgentLoop:
         session_manager: SessionManager | None = None,
         mcp_servers: dict | None = None,
         channels_config: ChannelsConfig | None = None,
+        ikuncode_config: ProviderConfig | None = None,
     ):
         from nanobot.config.schema import ExecToolConfig
         self.bus = bus
         self.channels_config = channels_config
+        self.ikuncode_config = ikuncode_config
         self.provider = provider
         self.workspace = workspace
         self.model = model or provider.get_default_model()
@@ -98,6 +112,7 @@ class AgentLoop:
             web_proxy=web_proxy,
             exec_config=self.exec_config,
             restrict_to_workspace=restrict_to_workspace,
+            ikuncode_config=ikuncode_config,
         )
 
         self._running = False
@@ -108,6 +123,7 @@ class AgentLoop:
         self._consolidating: set[str] = set()  # Session keys with consolidation in progress
         self._consolidation_tasks: set[asyncio.Task] = set()  # Strong refs to in-flight tasks
         self._consolidation_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
+        self._archive_tasks: set[asyncio.Task] = set()  # Strong refs to /new archival tasks
         self._active_tasks: dict[str, list[asyncio.Task]] = {}  # session_key -> tasks
         self._processing_lock = asyncio.Lock()
         self._register_default_tools()
@@ -115,6 +131,14 @@ class AgentLoop:
     def _register_default_tools(self) -> None:
         """Register the default set of tools."""
         allowed_dir = self.workspace if self.restrict_to_workspace else None
+        ikuncode_api_key = None
+        ikuncode_api_base = None
+        if self.ikuncode_config:
+            ikuncode_api_key = (
+                getattr(self.ikuncode_config, "api_key", None)
+                or getattr(self.ikuncode_config, "apikey", None)
+            )
+            ikuncode_api_base = getattr(self.ikuncode_config, "api_base", None)
         for cls in (ReadFileTool, WriteFileTool, EditFileTool, ListDirTool):
             self.tools.register(cls(workspace=self.workspace, allowed_dir=allowed_dir))
         self.tools.register(ExecTool(
@@ -125,6 +149,13 @@ class AgentLoop:
         ))
         self.tools.register(WebSearchTool(api_key=self.brave_api_key, proxy=self.web_proxy))
         self.tools.register(WebFetchTool(proxy=self.web_proxy))
+        self.tools.register(
+            IkunImageTool(
+                workspace=self.workspace,
+                api_key=ikuncode_api_key,
+                api_base=ikuncode_api_base,
+            )
+        )
         self.tools.register(MessageTool(send_callback=self.bus.publish_outbound))
         self.tools.register(SpawnTool(manager=self.subagents))
         if self.cron_service:
@@ -177,10 +208,76 @@ class AgentLoop:
             return f'{tc.name}("{val[:40]}…")' if len(val) > 40 else f'{tc.name}("{val}")'
         return ", ".join(_fmt(tc) for tc in tool_calls)
 
+    @staticmethod
+    def _now_iso() -> str:
+        return datetime.now().isoformat()
+
+    def _get_active_task(self, session: Session) -> dict[str, Any] | None:
+        metadata = getattr(session, "metadata", None)
+        if not isinstance(metadata, dict):
+            return None
+        task = metadata.get(self._TASK_META_KEY)
+        return task if isinstance(task, dict) else None
+
+    def _set_active_task(self, session: Session, task: dict[str, Any]) -> None:
+        metadata = getattr(session, "metadata", None)
+        if not isinstance(metadata, dict):
+            return
+        metadata[self._TASK_META_KEY] = task
+        session.updated_at = datetime.now()
+
+    def _archive_snapshot_after_new(self, session_key: str, snapshot: list[dict[str, Any]]) -> None:
+        """Archive a copied snapshot in background so /new can return immediately."""
+        if not snapshot:
+            return
+
+        async def _run() -> None:
+            try:
+                temp = Session(key=session_key)
+                temp.messages = list(snapshot)
+                ok = await self._consolidate_memory(temp, archive_all=True)
+                if not ok:
+                    logger.warning("/new background archival failed for {}", session_key)
+            except Exception:
+                logger.exception("/new background archival crashed for {}", session_key)
+            finally:
+                task = asyncio.current_task()
+                if task is not None:
+                    self._archive_tasks.discard(task)
+
+        task = asyncio.create_task(_run())
+        self._archive_tasks.add(task)
+
+    def _build_continue_prompt(self, task: dict[str, Any]) -> str:
+        objective = str(task.get("objective") or "").strip() or "(unknown)"
+        last_message = str(task.get("last_assistant_message") or "").strip() or "(none)"
+        return (
+            "Continue the active task from where you left off.\n"
+            f"Original task: {objective}\n"
+            f"Last assistant update: {last_message}\n"
+            "Do not restart from scratch. Reuse prior progress and finish the task now."
+        )
+
+    def _infer_task_status(self, final_content: str) -> tuple[str, str]:
+        content = (final_content or "").strip()
+        lowered = content.lower()
+
+        if not content:
+            return "in_progress", "empty_response"
+        if self._MAX_ITER_MSG_PREFIX in content:
+            return "in_progress", "max_iterations"
+        if "encountered an error" in lowered or lowered.startswith("error calling llm"):
+            return "blocked", "error_response"
+        for pattern in self._IN_PROGRESS_PATTERNS:
+            if pattern.search(content):
+                return "in_progress", "future_intent"
+        return "completed", "final_response"
+
     async def _run_agent_loop(
         self,
         initial_messages: list[dict],
         on_progress: Callable[..., Awaitable[None]] | None = None,
+        allowed_tool_names: set[str] | None = None,
     ) -> tuple[str | None, list[str], list[dict]]:
         """Run the agent iteration loop. Returns (final_content, tools_used, messages)."""
         messages = initial_messages
@@ -193,7 +290,7 @@ class AgentLoop:
 
             response = await self.provider.chat(
                 messages=messages,
-                tools=self.tools.get_definitions(),
+                tools=self.tools.get_definitions(allowed_names=allowed_tool_names),
                 model=self.model,
                 temperature=self.temperature,
                 max_tokens=self.max_tokens,
@@ -228,7 +325,11 @@ class AgentLoop:
                     tools_used.append(tool_call.name)
                     args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
                     logger.info("Tool call: {}({})", tool_call.name, args_str[:200])
-                    result = await self.tools.execute(tool_call.name, tool_call.arguments)
+                    result = await self.tools.execute(
+                        tool_call.name,
+                        tool_call.arguments,
+                        allowed_names=allowed_tool_names,
+                    )
                     messages = self.context.add_tool_result(
                         messages, tool_call.id, tool_call.name, result
                     )
@@ -255,6 +356,28 @@ class AgentLoop:
             )
 
         return final_content, tools_used, messages
+
+    def _allowed_tool_names_for_message(self, msg: InboundMessage) -> set[str] | None:
+        """Return tool allowlist for this message, or None for full access."""
+        if msg.channel != "feishu":
+            return None
+        if not self.channels_config:
+            return None
+
+        feishu_cfg = getattr(self.channels_config, "feishu", None)
+        if not feishu_cfg:
+            return None
+
+        admin_ids = {str(x).strip() for x in (getattr(feishu_cfg, "admin_ids", []) or []) if str(x).strip()}
+        if not admin_ids:
+            return None
+
+        sender = str((msg.metadata or {}).get("group_sender_id") or msg.sender_id or "").strip()
+        if sender in admin_ids:
+            return None
+
+        all_tools = set(self.tools.tool_names)
+        return all_tools - self._ADMIN_ONLY_TOOLS
 
     async def run(self) -> None:
         """Run the agent loop, dispatching messages as tasks to stay responsive to /stop."""
@@ -297,11 +420,24 @@ class AgentLoop:
             try:
                 response = await self._process_message(msg)
                 if response is not None:
+                    if msg.channel == "feishu":
+                        response.metadata = dict(response.metadata or {})
+                        response.metadata.setdefault("message_id", (msg.metadata or {}).get("message_id"))
+                        response.metadata["_turn_done"] = True
                     await self.bus.publish_outbound(response)
                 elif msg.channel == "cli":
                     await self.bus.publish_outbound(OutboundMessage(
                         channel=msg.channel, chat_id=msg.chat_id,
                         content="", metadata=msg.metadata or {},
+                    ))
+                elif msg.channel == "feishu":
+                    meta = dict(msg.metadata or {})
+                    meta["_turn_done"] = True
+                    await self.bus.publish_outbound(OutboundMessage(
+                        channel=msg.channel,
+                        chat_id=msg.chat_id,
+                        content="",
+                        metadata=meta,
                     ))
             except asyncio.CancelledError:
                 logger.info("Task cancelled for session {}", msg.session_key)
@@ -384,14 +520,67 @@ class AgentLoop:
             finally:
                 self._consolidating.discard(session.key)
 
+            snapshot = session.messages[session.last_consolidated:]
             session.clear()
+            session.metadata = {}
             self.sessions.save(session)
             self.sessions.invalidate(session.key)
+            self._archive_snapshot_after_new(session.key, snapshot)
+            if msg.channel == "feishu":
+                meta = dict(msg.metadata or {})
+                meta["feishu_msg_type"] = "system"
+                meta["feishu_system_content"] = {
+                    "type": "divider",
+                    "params": {
+                        "divider_text": {
+                            "text": "新会话",
+                            "i18n_text": {
+                                "zh_CN": "新会话",
+                                "en_US": "New Session",
+                            },
+                        },
+                    },
+                    "options": {
+                        "need_rollup": True,
+                    },
+                }
+                return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id, content="", metadata=meta)
             return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
                                   content="New session started.")
+        if cmd == "/continue":
+            task = self._get_active_task(session)
+            if not task or task.get("status") in {"completed", "cancelled"}:
+                return OutboundMessage(
+                    channel=msg.channel,
+                    chat_id=msg.chat_id,
+                    content="No active task to continue. Send a new request first.",
+                )
         if cmd == "/help":
             return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
-                                  content="🐈 nanobot commands:\n/new — Start a new conversation\n/stop — Stop the current task\n/help — Show available commands")
+                                  content="🐈 nanobot commands:\n/new — Start a new conversation\n/continue — Continue the current task\n/stop — Stop the current task\n/help — Show available commands")
+        if cmd == "/botid":
+            bot_id = str(
+                (msg.metadata or {}).get("bot_open_id")
+                or (
+                    getattr(getattr(self.channels_config, "feishu", None), "bot_open_id", "")
+                    if self.channels_config else ""
+                )
+                or ""
+            ).strip()
+            if bot_id:
+                return OutboundMessage(
+                    channel=msg.channel,
+                    chat_id=msg.chat_id,
+                    content=f"Bot open_id: {bot_id}",
+                )
+            return OutboundMessage(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                content=(
+                    "Bot open_id is not resolved yet. "
+                    "Please @bot once in group, or set channels.feishu.botOpenId in config."
+                ),
+            )
 
         unconsolidated = len(session.messages) - session.last_consolidated
         if (unconsolidated >= self.memory_window and session.key not in self._consolidating):
@@ -411,6 +600,42 @@ class AgentLoop:
             _task = asyncio.create_task(_consolidate_and_unlock())
             self._consolidation_tasks.add(_task)
 
+        effective_message = msg.content
+        objective = msg.content
+        if cmd == "/continue":
+            task = self._get_active_task(session) or {}
+            objective = str(task.get("objective") or "").strip() or msg.content
+            effective_message = self._build_continue_prompt(task)
+            task["status"] = "running"
+            task["status_reason"] = "resumed"
+            task["objective"] = objective
+            task["updated_at"] = self._now_iso()
+            task["resume_count"] = int(task.get("resume_count") or 0) + 1
+            self._set_active_task(session, task)
+            self.sessions.save(session)
+        elif not cmd.startswith("/"):
+            self._set_active_task(
+                session,
+                {
+                    "status": "running",
+                    "status_reason": "new_request",
+                    "objective": objective,
+                    "created_at": self._now_iso(),
+                    "updated_at": self._now_iso(),
+                    "resume_count": 0,
+                    "turn_count": 0,
+                },
+            )
+            self.sessions.save(session)
+
+        if (
+            not cmd.startswith("/")
+            and bool((msg.metadata or {}).get("is_group"))
+            and str((msg.metadata or {}).get("group_sender_id") or "").strip()
+        ):
+            speaker = str((msg.metadata or {}).get("group_sender_id")).strip()
+            effective_message = f"[Group speaker: {speaker}]\n{msg.content}"
+
         self._set_tool_context(msg.channel, msg.chat_id, msg.metadata.get("message_id"))
         if message_tool := self.tools.get("message"):
             if isinstance(message_tool, MessageTool):
@@ -419,7 +644,7 @@ class AgentLoop:
         history = session.get_history(max_messages=self.memory_window)
         initial_messages = self.context.build_messages(
             history=history,
-            current_message=msg.content,
+            current_message=effective_message,
             media=msg.media if msg.media else None,
             channel=msg.channel, chat_id=msg.chat_id,
         )
@@ -432,18 +657,33 @@ class AgentLoop:
                 channel=msg.channel, chat_id=msg.chat_id, content=content, metadata=meta,
             ))
 
+        allowed_tool_names = self._allowed_tool_names_for_message(msg)
         final_content, _, all_msgs = await self._run_agent_loop(
-            initial_messages, on_progress=on_progress or _bus_progress,
+            initial_messages,
+            on_progress=on_progress or _bus_progress,
+            allowed_tool_names=allowed_tool_names,
         )
 
         if final_content is None:
             final_content = "I've completed processing but have no response to give."
 
         self._save_turn(session, all_msgs, 1 + len(history))
+        task = self._get_active_task(session)
+        if task:
+            status, reason = self._infer_task_status(final_content)
+            task["status"] = status
+            task["status_reason"] = reason
+            task["objective"] = objective
+            task["last_assistant_message"] = final_content
+            task["updated_at"] = self._now_iso()
+            task["turn_count"] = int(task.get("turn_count") or 0) + 1
+            self._set_active_task(session, task)
         self.sessions.save(session)
 
         if (mt := self.tools.get("message")) and isinstance(mt, MessageTool) and mt._sent_in_turn:
-            return None
+            task_status = str((task or {}).get("status") or "")
+            if task_status == "completed" or not task_status:
+                return None
 
         preview = final_content[:120] + "..." if len(final_content) > 120 else final_content
         logger.info("Response to {}:{}: {}", msg.channel, msg.sender_id, preview)

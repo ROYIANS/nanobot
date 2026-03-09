@@ -9,12 +9,13 @@ from typing import Any
 from loguru import logger
 
 from nanobot.agent.tools.filesystem import EditFileTool, ListDirTool, ReadFileTool, WriteFileTool
+from nanobot.agent.tools.ikunimage import IkunImageTool
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.shell import ExecTool
 from nanobot.agent.tools.web import WebFetchTool, WebSearchTool
 from nanobot.bus.events import InboundMessage
 from nanobot.bus.queue import MessageBus
-from nanobot.config.schema import ExecToolConfig
+from nanobot.config.schema import ExecToolConfig, ProviderConfig
 from nanobot.providers.base import LLMProvider
 
 
@@ -34,6 +35,7 @@ class SubagentManager:
         web_proxy: str | None = None,
         exec_config: "ExecToolConfig | None" = None,
         restrict_to_workspace: bool = False,
+        ikuncode_config: ProviderConfig | None = None,
     ):
         from nanobot.config.schema import ExecToolConfig
         self.provider = provider
@@ -47,6 +49,7 @@ class SubagentManager:
         self.web_proxy = web_proxy
         self.exec_config = exec_config or ExecToolConfig()
         self.restrict_to_workspace = restrict_to_workspace
+        self.ikuncode_config = ikuncode_config
         self._running_tasks: dict[str, asyncio.Task[None]] = {}
         self._session_tasks: dict[str, set[str]] = {}  # session_key -> {task_id, ...}
 
@@ -96,6 +99,14 @@ class SubagentManager:
             # Build subagent tools (no message tool, no spawn tool)
             tools = ToolRegistry()
             allowed_dir = self.workspace if self.restrict_to_workspace else None
+            ikuncode_api_key = None
+            ikuncode_api_base = None
+            if self.ikuncode_config:
+                ikuncode_api_key = (
+                    getattr(self.ikuncode_config, "api_key", None)
+                    or getattr(self.ikuncode_config, "apikey", None)
+                )
+                ikuncode_api_base = getattr(self.ikuncode_config, "api_base", None)
             tools.register(ReadFileTool(workspace=self.workspace, allowed_dir=allowed_dir))
             tools.register(WriteFileTool(workspace=self.workspace, allowed_dir=allowed_dir))
             tools.register(EditFileTool(workspace=self.workspace, allowed_dir=allowed_dir))
@@ -108,6 +119,13 @@ class SubagentManager:
             ))
             tools.register(WebSearchTool(api_key=self.brave_api_key, proxy=self.web_proxy))
             tools.register(WebFetchTool(proxy=self.web_proxy))
+            tools.register(
+                IkunImageTool(
+                    workspace=self.workspace,
+                    api_key=ikuncode_api_key,
+                    api_base=ikuncode_api_base,
+                )
+            )
             
             system_prompt = self._build_subagent_prompt()
             messages: list[dict[str, Any]] = [

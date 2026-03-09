@@ -128,6 +128,23 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         strip_model_prefix=True,  # anthropic/claude-3 → claude-3 → openai/claude-3
         model_overrides=(),
     ),
+    # IKuncode: OpenAI-compatible gateway; also exposes Gemini image APIs.
+    ProviderSpec(
+        name="ikuncode",
+        keywords=("ikuncode", "ikun"),
+        env_key="OPENAI_API_KEY",
+        display_name="IKuncode",
+        litellm_prefix="openai",
+        skip_prefixes=(),
+        env_extras=(),
+        is_gateway=True,
+        is_local=False,
+        detect_by_key_prefix="",
+        detect_by_base_keyword="ikuncode",
+        default_api_base="https://api.ikuncode.cc/v1",
+        strip_model_prefix=True,
+        model_overrides=(),
+    ),
     # SiliconFlow (硅基流动): OpenAI-compatible gateway, model names keep org prefix
     ProviderSpec(
         name="siliconflow",

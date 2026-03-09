@@ -35,7 +35,12 @@ class TestMessageToolSuppressLogic:
         loop = _make_loop(tmp_path)
         tool_call = ToolCallRequest(
             id="call1", name="message",
-            arguments={"content": "Hello", "channel": "feishu", "chat_id": "chat123"},
+            arguments={
+                "content": "",
+                "channel": "feishu",
+                "chat_id": "chat123",
+                "sticker_file_key": "file_v2_same_target_sticker",
+            },
         )
         calls = iter([
             LLMResponse(content="", tool_calls=[tool_call]),
@@ -138,6 +143,17 @@ class TestMessageToolTurnTracking:
         tool._sent_in_turn = True
         tool.start_turn()
         assert not tool._sent_in_turn
+
+
+def test_tool_hint_prefers_message_content_over_channel(tmp_path: Path) -> None:
+    loop = _make_loop(tmp_path)
+    tool_call = ToolCallRequest(
+        id="call1",
+        name="message",
+        arguments={"channel": "feishu", "chat_id": "ou_1", "content": "你好呀圈圈"},
+    )
+
+    assert loop._tool_hint([tool_call]) == 'message("你好呀圈圈")'
 
 
 class TestFeishuTurnDoneMetadata:

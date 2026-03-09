@@ -113,3 +113,36 @@ async def test_message_tool_supports_use_recent_sticker(monkeypatch) -> None:
     assert len(sent) == 1
     assert sent[0].metadata["feishu_msg_type"] == "sticker"
     assert sent[0].metadata["feishu_content"]["file_key"] == "file_v2_recent_xxx"
+
+
+@pytest.mark.asyncio
+async def test_message_tool_rejects_same_target_plain_text_reply() -> None:
+    sent = []
+    tool = MessageTool(send_callback=AsyncMock(side_effect=lambda m: sent.append(m)))
+    tool.set_context("feishu", "ou_1")
+
+    result = await tool.execute(
+        content="你好呀圈圈",
+        channel="feishu",
+        chat_id="ou_1",
+    )
+
+    assert "Use a normal assistant response instead" in result
+    assert sent == []
+
+
+@pytest.mark.asyncio
+async def test_message_tool_allows_same_target_non_text_feishu_message() -> None:
+    sent = []
+    tool = MessageTool(send_callback=AsyncMock(side_effect=lambda m: sent.append(m)))
+    tool.set_context("feishu", "ou_1")
+
+    result = await tool.execute(
+        content="",
+        channel="feishu",
+        chat_id="ou_1",
+        sticker_file_key="file_v2_sticker_same_target",
+    )
+
+    assert "Message sent to feishu:ou_1" in result
+    assert len(sent) == 1

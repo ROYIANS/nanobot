@@ -128,6 +128,8 @@ class MessageTool(Tool):
         if not self._send_callback:
             return "Error: Message sending not configured"
 
+        same_target = channel == self._default_channel and chat_id == self._default_chat_id
+
         metadata: dict[str, Any] = {
             "message_id": message_id,
         }
@@ -177,6 +179,16 @@ class MessageTool(Tool):
                 metadata["feishu_content"] = payload
                 if normalized == "system":
                     metadata["feishu_system_content"] = payload
+
+        normalized_msg_type = str(metadata.get("feishu_msg_type") or "").strip().lower()
+        same_target_plain_text = same_target and not media and (
+            not normalized_msg_type or normalized_msg_type == "text"
+        )
+        if same_target_plain_text:
+            return (
+                "Error: Use a normal assistant response instead of the message tool "
+                "for plain-text replies to the current chat."
+            )
 
         msg = OutboundMessage(
             channel=channel,

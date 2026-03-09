@@ -202,7 +202,15 @@ class AgentLoop:
         """Format tool calls as concise hint, e.g. 'web_search("query")'."""
         def _fmt(tc):
             args = (tc.arguments[0] if isinstance(tc.arguments, list) else tc.arguments) or {}
-            val = next(iter(args.values()), None) if isinstance(args, dict) else None
+            val = None
+            if isinstance(args, dict):
+                for preferred_key in ("content", "path", "query", "url", "chat_id", "channel"):
+                    preferred_val = args.get(preferred_key)
+                    if isinstance(preferred_val, str) and preferred_val:
+                        val = preferred_val
+                        break
+                if val is None:
+                    val = next(iter(args.values()), None)
             if not isinstance(val, str):
                 return tc.name
             return f'{tc.name}("{val[:40]}…")' if len(val) > 40 else f'{tc.name}("{val}")'

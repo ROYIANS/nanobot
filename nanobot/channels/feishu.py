@@ -1537,11 +1537,15 @@ class FeishuChannel(BaseChannel):
             while len(self._processed_message_ids) > 1000:
                 self._processed_message_ids.popitem(last=False)
 
-            # Skip bot messages
-            if sender.sender_type == "bot":
+            sender_id = sender.sender_id.open_id if sender.sender_id else "unknown"
+            bot_open_id = str(self._bot_open_id or self.config.bot_open_id or "").strip()
+
+            # Skip messages sent by the bot itself. In Feishu P2P chats these can
+            # arrive as sender_type="user" while still carrying the bot's open_id,
+            # which would otherwise trigger an infinite self-conversation loop.
+            if sender.sender_type == "bot" or (bot_open_id and sender_id == bot_open_id):
                 return
 
-            sender_id = sender.sender_id.open_id if sender.sender_id else "unknown"
             chat_id = message.chat_id
             chat_type = message.chat_type
             msg_type = message.message_type

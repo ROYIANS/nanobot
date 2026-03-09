@@ -192,6 +192,39 @@ async def test_on_message_records_reaction_id_for_cleanup(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
+async def test_on_message_ignores_bot_self_message_in_p2p(monkeypatch) -> None:
+    channel = _make_channel()
+    channel.config.bot_open_id = "ou_bot"
+    channel._bot_open_id = "ou_bot"
+    channel._add_reaction = AsyncMock(return_value="reaction_self")
+    channel._handle_message = AsyncMock()
+    create_card = AsyncMock()
+    monkeypatch.setattr(channel, "_create_processing_card_for_message", create_card)
+
+    data = SimpleNamespace(
+        event=SimpleNamespace(
+            message=SimpleNamespace(
+                message_id="om_self_1",
+                chat_id="oc_p2p",
+                chat_type="p2p",
+                message_type="text",
+                content=json.dumps({"text": "我在的呀"}),
+            ),
+            sender=SimpleNamespace(
+                sender_type="user",
+                sender_id=SimpleNamespace(open_id="ou_bot"),
+            ),
+        )
+    )
+
+    await channel._on_message(data)
+
+    channel._add_reaction.assert_not_awaited()
+    create_card.assert_not_awaited()
+    channel._handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_on_message_skips_processing_card_for_slash_command(monkeypatch) -> None:
     channel = _make_channel()
     channel._add_reaction = AsyncMock(return_value="reaction_cmd")
